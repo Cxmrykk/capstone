@@ -1,3 +1,15 @@
-[submodule "text2cypher-2024v1"]
-	path = text2cypher-2024v1
+[submodule "data/text2cypher-2024v1"]
+	path = data/text2cypher-2024v1
 	url = https://huggingface.co/datasets/neo4j/text2cypher-2024v1
+[submodule "data/Qwen3.5-4B"]
+	path = data/Qwen3.5-4B
+	url = https://huggingface.co/Qwen/Qwen3.5-4B
+[submodule "data/gemma-4-E2B"]
+	path = data/gemma-4-E2B
+	url = https://huggingface.co/google/gemma-4-E2B
+[submodule "data/gemma-4-E4B"]
+	path = data/gemma-4-E4B
+	url = https://huggingface.co/google/gemma-4-E4B
+[submodule "data/Qwen3.5-2B"]
+	path = data/Qwen3.5-2B
+	url = https://huggingface.co/Qwen/Qwen3.5-2B
