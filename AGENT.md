@@ -23,3 +23,5 @@ Do not use a rigid, corporate template. Just write a clean, informal Markdown fi
 1. **Context:** A quick one-liner about what we were trying to achieve.
 2. **Changes & Reasons:** A bulleted list summarizing the files you changed, what you did, and crucially, _why_ you did it.
 3. **User Logs:** A code block containing the exact terminal output, error tracebacks, or training metrics (Loss, Exact Match scores, VRAM usage) that I pasted to you.
+
+When putting the log inside a markdown code block, make sure to use four backticks: \`\`\`\`markdown.

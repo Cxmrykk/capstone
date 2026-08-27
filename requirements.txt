@@ -1,0 +1,4 @@
+huggingface_hub[cli,hf_transfer]
+pandas
+pyarrow
+datasets
