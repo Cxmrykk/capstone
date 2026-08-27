@@ -1,0 +1,3 @@
+[submodule "text2cypher-2024v1"]
+	path = text2cypher-2024v1
+	url = https://huggingface.co/datasets/neo4j/text2cypher-2024v1
