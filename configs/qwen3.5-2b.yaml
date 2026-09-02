@@ -1,0 +1,68 @@
+# Baseline configuration: Qwen3.5-2B, full "enhanced" schema in the prompt.
+# Sized for a Colab free-tier T4 (16 GB, fp16 only -- no bf16 on Turing).
+run_name: qwen3.5-2b-enhanced
+
+model:
+  key: qwen3.5-2b
+  load_in_4bit: true
+  attn_implementation: auto
+  use_unsloth: auto          # falls back to transformers+peft if unsupported
+
+data:
+  schema_mode: enhanced      # enhanced | base | exact_match | ner_exact_match | similarity | none
+  max_seq_length: 2048
+  val_fraction: 0.02
+  max_val_samples: 400
+  max_train_samples: null    # null = all 39,554 training instances
+  max_eval_samples: 1000     # cap on the test split for prediction runs
+  seed: 3407
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  bias: none
+  target_modules: auto       # discovered from the module tree; excludes vision/audio
+
+train:
+  learning_rate: 2.0e-4
+  num_train_epochs: 1
+  max_steps: -1
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8      # effective batch size 16
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  optim: paged_adamw_8bit
+  weight_decay: 0.01
+  max_grad_norm: 0.3
+  logging_steps: 10
+  save_steps: 50                       # checkpoint + Hub upload cadence
+  eval_steps: 250
+  save_total_limit: 2
+  gradient_checkpointing: true
+  group_by_length: false
+  dataloader_num_workers: 2
+  seed: 3407
+  time_limit_minutes: 210              # stop cleanly before Colab reclaims the session
+  report_to: []                        # add "wandb" once WANDB_API_KEY is set
+
+hub:
+  repo_id: null              # REQUIRED: e.g. "your-hf-username/t2c-capstone-checkpoints"
+  private: true
+  sync: true
+  keep_last: 2
+  async_upload: true
+  drive_mirror: null
+
+generation:
+  max_new_tokens: 256
+  temperature: 0.0
+  batch_size: 8
+  do_sample: false
+
+neo4j:
+  provider: demo
+  order_sensitive: true
+  compare_keys: false
+  min_interval_s: 0.05

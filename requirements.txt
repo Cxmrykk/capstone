@@ -1,4 +1,36 @@
+# Core -- needed everywhere (laptop and Colab)
 huggingface_hub[cli,hf_transfer]
 pandas
 pyarrow
 datasets
+PyYAML
+requests
+tqdm
+
+# Training stack. On Colab, torch is already present -- pip will keep it.
+#
+# Note on dtype: a free-tier T4 is Turing (sm_75) and has NO bfloat16 support.
+# The toolkit detects this and trains in fp16 automatically; do not force bf16.
+torch>=2.3.0
+transformers>=4.45.0
+accelerate>=0.34.0
+peft>=0.13.0
+bitsandbytes>=0.43.0
+sentencepiece
+protobuf
+safetensors
+
+# Optional, tried first by the model loader and skipped if it cannot load the
+# architecture. Install separately on Colab: pip install unsloth
+# unsloth
+
+# Optional experiment tracking (set train.report_to: ["wandb"] to enable)
+# wandb
+
+# Execution-based evaluation against Neo4j
+neo4j>=5.20.0
+requests
+
+# Optional: enables schema_mode: similarity (embedding-based schema pruning).
+# Everything else works without it; the filter degrades to exact-match.
+# sentence-transformers

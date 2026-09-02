@@ -1,0 +1,61 @@
+run_name: gemma-4-e2b-enhanced
+
+model:
+  key: gemma-4-e2b
+  load_in_4bit: true
+  # Gemma configs carry final_logit_softcapping; eager attention is the safe
+  # implementation when softcapping is active (resolved from the ModelSpec).
+  attn_implementation: auto
+  use_unsloth: auto
+
+data:
+  schema_mode: enhanced
+  max_seq_length: 2048
+  val_fraction: 0.02
+  max_val_samples: 400
+  max_train_samples: null
+  max_eval_samples: 1000
+  seed: 3407
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  bias: none
+  target_modules: auto
+
+train:
+  learning_rate: 2.0e-4
+  num_train_epochs: 1
+  max_steps: -1
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  optim: paged_adamw_8bit
+  weight_decay: 0.01
+  max_grad_norm: 0.3
+  logging_steps: 10
+  save_steps: 50
+  eval_steps: 250
+  save_total_limit: 2
+  gradient_checkpointing: true
+  dataloader_num_workers: 2
+  seed: 3407
+  time_limit_minutes: 210
+  report_to: []
+
+hub:
+  repo_id: null
+  private: true
+  sync: true
+  keep_last: 2
+
+generation:
+  max_new_tokens: 256
+  temperature: 0.0
+  batch_size: 8
+
+neo4j:
+  provider: demo
