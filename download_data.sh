@@ -11,12 +11,13 @@ fi
 export HF_XET_HIGH_PERFORMANCE=1
 
 # List of targets: "repo_type repo_id local_dir"
+# Only download the target LLM
 REPOS=(
     "dataset neo4j/text2cypher-2024v1 data/text2cypher-2024v1"
     "model google/gemma-4-E2B data/gemma-4-E2B"
-    "model google/gemma-4-E4B data/gemma-4-E4B"
-    "model Qwen/Qwen3.5-2B data/Qwen3.5-2B"
-    "model Qwen/Qwen3.5-4B data/Qwen3.5-4B"
+    # "model google/gemma-4-E4B data/gemma-4-E4B"
+    # "model Qwen/Qwen3.5-2B data/Qwen3.5-2B"
+    # "model Qwen/Qwen3.5-4B data/Qwen3.5-4B"
 )
 
 for ENTRY in "${REPOS[@]}"; do
