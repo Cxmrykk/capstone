@@ -89,7 +89,8 @@ class TransformersBackend(GenerationBackend):
             idxs = order[start:start + batch_size]
             batch = [prompts[i] for i in idxs]
 
-            enc = tok(batch, return_tensors="pt", padding=True,
+            # Use text= kwarg explicitly to prevent Processors from misinterpreting inputs as images
+            enc = tok(text=batch, return_tensors="pt", padding=True,
                       add_special_tokens=False).to(device)
 
             with torch.inference_mode():
