@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from tqdm import tqdm
+
 from src.config import RunConfig
 from src.data.prompts import build_messages, render_prompt, template_supports_system
 from src.data.schema_filter import apply_schema_mode, trim_schema_text
@@ -203,7 +205,8 @@ def tokenize_examples(
     n_trimmed = 0
     n_dropped = 0
 
-    for record in records:
+    # Added tqdm to display progress during the lengthy tokenization phase
+    for record in tqdm(records, desc=f"Tokenizing {desc}", leave=False):
         question = record.get("question") or ""
         raw_schema = record.get("schema") or ""
         target = (record.get("cypher") or "").strip()
