@@ -180,12 +180,23 @@ class Text2CypherDataset:
         return self.features[idx]
 
 
+def _flatten_ids(ids: Any) -> List[int]:
+    """Ensures tokenizer outputs from multimodal Processors are flattened into 1D lists."""
+    if isinstance(ids, list):
+        if len(ids) > 0 and isinstance(ids[0], list):
+            return list(ids[0])
+        return list(ids)
+    if hasattr(ids, "ndim") and getattr(ids, "ndim") == 2:
+        return ids[0].tolist()
+    return list(ids)
+
+
 def _target_ids(tokenizer, target: str) -> List[int]:
     # Use text= kwarg explicitly to prevent Processors from treating it as an image
-    ids = tokenizer(text=target, add_special_tokens=False)["input_ids"]
+    ids = _flatten_ids(tokenizer(text=target, add_special_tokens=False)["input_ids"])
     eos = tokenizer.eos_token_id
     if eos is not None and (not ids or ids[-1] != eos):
-        ids = ids + [eos]
+        ids.append(eos)
     return ids
 
 
@@ -235,8 +246,8 @@ def tokenize_examples(
                 supports_system_role=supports_system,
                 chat_template_kwargs=cfg.model.spec.chat_template_kwargs,
             )
-            # Use text= kwarg explicitly
-            prompt_ids = tokenizer(text=prompt, add_special_tokens=False)["input_ids"]
+            # Use text= kwarg explicitly and flatten multimodal outputs
+            prompt_ids = _flatten_ids(tokenizer(text=prompt, add_special_tokens=False)["input_ids"])
             overflow = len(prompt_ids) + len(target_ids) - max_len
             if overflow <= 0:
                 break
@@ -386,8 +397,7 @@ def preview_example(cfg: RunConfig, index: int = 0, split: str = "train",
         "=" * 72,
     ]
     if tokenizer is not None:
-        # Use text= kwarg explicitly
-        p_ids = tokenizer(text=example.prompt, add_special_tokens=False)["input_ids"]
+        p_ids = _flatten_ids(tokenizer(text=example.prompt, add_special_tokens=False)["input_ids"])
         t_ids = _target_ids(tokenizer, example.target)
         out.append(f"prompt tokens : {len(p_ids)}")
         out.append(f"target tokens : {len(t_ids)}")
@@ -418,8 +428,8 @@ def token_length_stats(cfg: RunConfig, n_samples: int = 1000) -> str:
         prompt = render_prompt(tokenizer, r.get("question") or "", schema_text,
                                supports_system_role=supports_system,
                                chat_template_kwargs=cfg.model.spec.chat_template_kwargs)
-        # Use text= kwarg explicitly
-        n_prompt = len(tokenizer(text=prompt, add_special_tokens=False)["input_ids"])
+        n_prompt_ids = _flatten_ids(tokenizer(text=prompt, add_special_tokens=False)["input_ids"])
+        n_prompt = len(n_prompt_ids)
         n_target = len(_target_ids(tokenizer, (r.get("cypher") or "").strip()))
         lengths.append(n_prompt + n_target)
 
