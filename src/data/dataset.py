@@ -1,4 +1,8 @@
-"""Loading, prompt-building and tokenisation of text2cypher-2024v1."""
+"""Dataset loading, prompt construction, and tokenization for Text2Cypher training.
+
+Handles Parquet loading, reproducible train/validation splitting, token budget
+enforcement, and manual label masking to compute loss exclusively over target Cypher tokens.
+"""
 from __future__ import annotations
 
 import json
@@ -21,29 +25,27 @@ _SPLIT_FILES = {
     "test": "data/test-00000-of-00001.parquet",
 }
 
-# The published schema names the column `database_reference`; the shipped
-# parquet uses `database_reference_alias`. Accept both.
 _DB_FIELDS = ("database_reference_alias", "database_reference", "database")
 
 
 # --------------------------------------------------------------------------- #
-# Raw loading
+# Raw Loading
 # --------------------------------------------------------------------------- #
 def _parquet_path(split: str, override: Optional[str] = None) -> Path:
     if split not in _SPLIT_FILES:
-        raise ValueError(f"split must be one of {list(_SPLIT_FILES)}, got {split!r}")
+        raise ValueError(f"Split must be one of {list(_SPLIT_FILES)}, got {split!r}")
     root = dataset_dir(override)
     path = root / _SPLIT_FILES[split]
     if not path.exists():
         raise FileNotFoundError(
-            f"Missing {path}.\n"
-            "Pull the dataset first:  ./download_data.sh   (or: git submodule update --init)"
+            f"Missing dataset file: {path}.\n"
+            "Run ./download_data.sh to download the benchmark dataset."
         )
     return path
 
 
 def load_raw_split(split: str, dataset_dir_override: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return the split as a list of plain dicts (no `datasets` dependency needed)."""
+    """Loads a dataset partition as a list of dictionaries."""
     path = _parquet_path(split, dataset_dir_override)
     try:
         import pyarrow.parquet as pq
@@ -79,15 +81,11 @@ def list_database_aliases(dataset_dir_override: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
-# Splitting
+# Splitting & Sampling
 # --------------------------------------------------------------------------- #
 def subsample(records: Sequence[Dict[str, Any]], limit: Optional[int],
               seed: int) -> List[Dict[str, Any]]:
-    """Deterministic subsample -- the same seed always yields the same rows.
-
-    This matters when a Colab session dies: the resumed run must see the exact
-    same data ordering as the run that produced the checkpoint.
-    """
+    """Deterministically samples records using a fixed random seed."""
     records = list(records)
     if limit is None or limit >= len(records):
         return records
@@ -99,7 +97,7 @@ def subsample(records: Sequence[Dict[str, Any]], limit: Optional[int],
 def make_train_val_split(records: Sequence[Dict[str, Any]], val_fraction: float,
                          max_val: int, seed: int
                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Carve a validation set out of train; the official test split is untouched."""
+    """Splits a training list into training and validation sets while leaving test untouched."""
     records = list(records)
     if val_fraction <= 0:
         return records, []
@@ -114,7 +112,7 @@ def make_train_val_split(records: Sequence[Dict[str, Any]], val_fraction: float,
 
 
 # --------------------------------------------------------------------------- #
-# Prompt building
+# Prompt Construction
 # --------------------------------------------------------------------------- #
 @dataclass
 class BuiltExample:
@@ -165,15 +163,10 @@ def build_example(record: Dict[str, Any], cfg: RunConfig, tokenizer=None,
 
 
 # --------------------------------------------------------------------------- #
-# Tokenisation into a training dataset
+# Tokenization & Dataset Construction
 # --------------------------------------------------------------------------- #
 class Text2CypherDataset:
-    """A plain list-backed torch Dataset.
-
-    Deliberately not `datasets.Dataset` or TRL's SFTTrainer: we build the label
-    mask by hand so that loss is computed on the Cypher tokens only, with no
-    dependence on a response-template string that changes per chat template.
-    """
+    """Lightweight PyTorch Dataset holding pre-tokenized inputs and label masks."""
 
     def __init__(self, features: List[Dict[str, List[int]]]) -> None:
         self.features = features
@@ -199,6 +192,7 @@ def tokenize_examples(
     tokenizer,
     desc: str = "",
 ) -> Text2CypherDataset:
+    """Tokenizes examples and constructs label masks (-100 for prompt tokens)."""
     max_len = cfg.data.max_seq_length
     supports_system = cfg.model.spec.supports_system_role
     if supports_system is None:
@@ -226,7 +220,6 @@ def tokenize_examples(
 
         target_ids = _target_ids(tokenizer, target)
         if len(target_ids) + 32 > max_len:
-            # No prompt budget left; this row cannot teach anything useful.
             n_dropped += 1
             continue
 
@@ -243,12 +236,8 @@ def tokenize_examples(
             if overflow <= 0:
                 break
             trimmed_this_row = True
-            # ~3.5 chars/token is a reasonable estimate for schema text; the
-            # loop corrects any under-estimate on the next pass.
             schema_text = trim_schema_text(schema_text, int(overflow * 3.5) + 64)
             if attempt == 4:
-                # Last resort: keep the tail, which holds the question and the
-                # generation prefix.
                 keep = max_len - len(target_ids)
                 prompt_ids = prompt_ids[-keep:] if keep > 0 else []
 
@@ -268,7 +257,7 @@ def tokenize_examples(
         features.append({"input_ids": input_ids, "labels": labels})
 
     log.info(
-        "%sTokenised %d examples (schema_mode=%s, max_len=%d); %d schema-trimmed, %d dropped.",
+        "%sTokenized %d examples (schema_mode=%s, max_len=%d); %d schema-trimmed, %d dropped.",
         f"[{desc}] " if desc else "", len(features), cfg.data.schema_mode,
         max_len, n_trimmed, n_dropped,
     )
@@ -276,11 +265,11 @@ def tokenize_examples(
 
 
 # --------------------------------------------------------------------------- #
-# Collator
+# Data Collator
 # --------------------------------------------------------------------------- #
 @dataclass
 class Text2CypherCollator:
-    """Pads a batch and masks prompt tokens out of the loss."""
+    """Pads dynamic batches and pads labels with -100 to ignore prompt loss."""
 
     pad_token_id: int
     label_pad_token_id: int = -100
@@ -299,7 +288,6 @@ class Text2CypherCollator:
             ids = list(f["input_ids"])
             lab = list(f["labels"])
             pad = max_len - len(ids)
-            # Right padding: correct for training (generation uses left padding).
             input_ids.append(ids + [self.pad_token_id] * pad)
             labels.append(lab + [self.label_pad_token_id] * pad)
             attention.append([1] * len(ids) + [0] * pad)
@@ -312,7 +300,7 @@ class Text2CypherCollator:
 
 
 # --------------------------------------------------------------------------- #
-# CLI helpers
+# Data Inspection Helpers
 # --------------------------------------------------------------------------- #
 def dataset_stats(dataset_dir_override: Optional[str] = None) -> str:
     lines: List[str] = ["Dataset: text2cypher-2024v1", "=" * 60]
@@ -360,7 +348,7 @@ def preview_example(cfg: RunConfig, index: int = 0, split: str = "train",
                     use_tokenizer: bool = True) -> str:
     records = load_raw_split(split, cfg.data.dataset_dir)
     if index >= len(records):
-        raise IndexError(f"index {index} out of range ({len(records)} rows in {split})")
+        raise IndexError(f"Index {index} out of range ({len(records)} rows in {split})")
     record = records[index]
 
     tokenizer = None
@@ -369,7 +357,7 @@ def preview_example(cfg: RunConfig, index: int = 0, split: str = "train",
             from src.training.model_loader import load_tokenizer
             tokenizer = load_tokenizer(cfg)
         except Exception as exc:
-            log.warning("Could not load tokenizer (%s); showing raw prompt body.", exc)
+            log.warning("Could not load tokenizer (%s); rendering raw prompt body.", exc)
 
     example = build_example(record, cfg, tokenizer)
 

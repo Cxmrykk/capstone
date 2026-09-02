@@ -1,6 +1,5 @@
-# Ablation configuration: Qwen3.5-2B with exact-match heuristic schema filtering.
-# Evaluates the effect of schema pruning on accuracy and token efficiency.
-# Identical to qwen3.5-2b.yaml except for data.schema_mode.
+# Configuration: Qwen3.5-2B with dynamic exact-match schema pruning.
+# Prunes irrelevant node labels and properties based on question tokens to reduce prompt length.
 run_name: qwen3.5-2b-exact-match
 
 model:

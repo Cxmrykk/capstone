@@ -1,7 +1,7 @@
-"""Configuration objects and the model registry.
+"""Configuration management and base model registry.
 
-Every knob the experiments need lives here so that runs are reproducible from a
-single YAML file plus a handful of CLI overrides.
+Encapsulates all runtime, training, data processing, generation, and evaluation
+parameters to ensure reproducible runs via YAML files and CLI overrides.
 """
 from __future__ import annotations
 
@@ -21,22 +21,22 @@ log = get_logger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Model registry
+# Model Registry
 # --------------------------------------------------------------------------- #
 @dataclass
 class ModelSpec:
-    """Static facts about a base model that the code cannot reliably infer."""
+    """Metadata and architectural specifications for supported base models."""
 
     key: str
     hf_id: str
     local_dirname: str
     family: str                      # "gemma" | "qwen" | "generic"
     attn_implementation: str = "sdpa"
-    # Passed to tokenizer.apply_chat_template(). Qwen3.5 emits a <think> block
-    # unless thinking is explicitly disabled, which would poison SFT targets.
+    # Arguments passed to tokenizer.apply_chat_template(). For instance, disabling
+    # reasoning traces prevents unwanted prefix tokens during instruction tuning.
     chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
-    supports_system_role: Optional[bool] = None   # None => probe at runtime
-    # Substrings of module paths that must never receive LoRA adapters.
+    supports_system_role: Optional[bool] = None   # None triggers runtime probing
+    # Module path substrings that should be excluded from LoRA adaptation
     lora_exclude_substrings: List[str] = field(default_factory=lambda: [
         "vision", "visual", "audio", "mm_projector", "multi_modal",
         "embed_tokens", "lm_head", "per_layer", "altup", "conv1d",
@@ -44,7 +44,7 @@ class ModelSpec:
     notes: str = ""
 
     def resolve_path(self, override: Optional[str] = None) -> str:
-        """Prefer a local checkout (submodule) over a Hub download."""
+        """Resolves model path, prioritizing local checkouts over remote Hub identifiers."""
         if override:
             return str(Path(override).expanduser())
         env = os.environ.get(f"T2C_MODEL_{self.key.upper().replace('.', '_').replace('-', '_')}")
@@ -62,11 +62,9 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         hf_id="google/gemma-4-E2B",
         local_dirname="gemma-4-E2B",
         family="gemma",
-        # Gemma configs carry final_logit_softcapping; eager attention is the
-        # safe implementation when softcapping is active.
         attn_implementation="eager",
         supports_system_role=False,
-        notes="Multimodal wrapper (text/vision/audio); we train the text tower only.",
+        notes="Multimodal architecture; adapts the core language transformer layers.",
     ),
     "gemma-4-e4b": ModelSpec(
         key="gemma-4-e4b",
@@ -75,7 +73,7 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         family="gemma",
         attn_implementation="eager",
         supports_system_role=False,
-        notes="Multimodal wrapper (text/vision/audio); we train the text tower only.",
+        notes="Multimodal architecture; adapts the core language transformer layers.",
     ),
     "qwen3.5-2b": ModelSpec(
         key="qwen3.5-2b",
@@ -85,7 +83,7 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         attn_implementation="sdpa",
         chat_template_kwargs={"enable_thinking": False},
         supports_system_role=True,
-        notes="Hybrid linear/full attention; GGUF support must be verified per llama.cpp build.",
+        notes="Hybrid attention model with standard chat template support.",
     ),
     "qwen3.5-4b": ModelSpec(
         key="qwen3.5-4b",
@@ -95,11 +93,11 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         attn_implementation="sdpa",
         chat_template_kwargs={"enable_thinking": False},
         supports_system_role=True,
-        notes="Hybrid linear/full attention; GGUF support must be verified per llama.cpp build.",
+        notes="Hybrid attention model with standard chat template support.",
     ),
 }
 
-# Convenience aliases so the CLI accepts the names used in the proposal.
+# CLI aliases for model keys
 MODEL_ALIASES = {
     "gemma-2b": "gemma-4-e2b",
     "gemma2b": "gemma-4-e2b",
@@ -119,12 +117,12 @@ def get_model_spec(key: str) -> ModelSpec:
     norm = MODEL_ALIASES.get(norm, norm)
     if norm not in MODEL_REGISTRY:
         known = ", ".join(sorted(MODEL_REGISTRY) + sorted(MODEL_ALIASES))
-        raise KeyError(f"Unknown model key '{key}'. Known keys: {known}")
+        raise KeyError(f"Unknown model key '{key}'. Supported models: {known}")
     return MODEL_REGISTRY[norm]
 
 
 # --------------------------------------------------------------------------- #
-# Config sections
+# Config Sections
 # --------------------------------------------------------------------------- #
 SCHEMA_MODES = ("enhanced", "base", "exact_match", "ner_exact_match", "similarity", "none")
 
@@ -134,7 +132,7 @@ class ModelConfig:
     key: str = "qwen3.5-2b"
     path: Optional[str] = None
     load_in_4bit: bool = True
-    attn_implementation: str = "auto"     # "auto" defers to the ModelSpec
+    attn_implementation: str = "auto"     # "auto" uses the ModelSpec default
     use_unsloth: str = "auto"             # "auto" | "yes" | "no"
     trust_remote_code: bool = True
 
@@ -160,7 +158,7 @@ class DataConfig:
     max_train_samples: Optional[int] = None
     max_eval_samples: Optional[int] = None
     seed: int = 3407
-    # Schema filtering knobs (Ozsoy 2025).
+    # Schema filtering parameters
     filter_min_nodes: int = 1
     filter_keep_all_patterns_for_kept_nodes: bool = True
     similarity_threshold: float = 0.45
@@ -203,7 +201,7 @@ class TrainConfig:
     dataloader_num_workers: int = 2
     seed: int = 3407
     time_limit_minutes: Optional[float] = None
-    report_to: List[str] = field(default_factory=list)   # e.g. ["wandb"]
+    report_to: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -214,7 +212,7 @@ class HubConfig:
     keep_last: int = 2
     token_env: str = "HF_TOKEN"
     async_upload: bool = True
-    drive_mirror: Optional[str] = None   # e.g. "/content/drive/MyDrive/t2c-ckpt"
+    drive_mirror: Optional[str] = None
 
 
 @dataclass
@@ -236,15 +234,13 @@ class Neo4jConfig:
     local_user: str = "neo4j"
     local_password_env: str = "NEO4J_PASSWORD"
     local_database: str = "neo4j"
-    # Neo4j Community edition hosts exactly one database; when running locally
-    # you can only evaluate the alias whose dump is currently loaded.
     local_alias: Optional[str] = None
     query_timeout_s: float = 30.0
     connection_timeout_s: float = 20.0
-    min_interval_s: float = 0.05           # politeness throttle for the demo server
+    min_interval_s: float = 0.05           # Rate-limiting pause between remote queries
     max_retries: int = 2
-    order_sensitive: bool = True           # honour ORDER BY in the gold query
-    compare_keys: bool = False             # compare column names as well as values
+    order_sensitive: bool = True           # Maintain row order when ORDER BY is in gold query
+    compare_keys: bool = False             # Validate returned column names in addition to values
     float_ndigits: int = 6
 
 
@@ -261,7 +257,6 @@ class RunConfig:
     neo4j: Neo4jConfig = field(default_factory=Neo4jConfig)
     config_path: Optional[str] = None
 
-    # -- derived ---------------------------------------------------------- #
     def resolved_output_dir(self) -> Path:
         if self.output_dir:
             path = Path(self.output_dir).expanduser()
@@ -274,10 +269,10 @@ class RunConfig:
         return dataclasses.asdict(self)
 
     def fingerprint(self) -> str:
-        """Stable hash of the training-relevant settings.
+        """Generates a deterministic hash of training-critical parameters.
 
-        Used to refuse a resume when the config has drifted since the
-        checkpoint was written -- a real risk when hopping between accounts.
+        Ensures that checkpoint resumption is refused if the underlying
+        hyperparameters or dataset configurations have changed.
         """
         relevant = {
             "model": dataclasses.asdict(self.model),
@@ -285,7 +280,6 @@ class RunConfig:
             "lora": dataclasses.asdict(self.lora),
             "train": {
                 k: v for k, v in dataclasses.asdict(self.train).items()
-                # These may legitimately change between sessions.
                 if k not in {"time_limit_minutes", "report_to", "save_steps",
                              "logging_steps", "dataloader_num_workers"}
             },
@@ -303,7 +297,7 @@ class RunConfig:
 
 
 # --------------------------------------------------------------------------- #
-# Loading
+# Loading Helpers
 # --------------------------------------------------------------------------- #
 _SECTION_TYPES = {
     "model": ModelConfig,
@@ -325,7 +319,7 @@ def _build_section(cls, payload: Dict[str, Any], name: str):
         else:
             unknown.append(k)
     if unknown:
-        log.warning("Ignoring unknown keys in config section '%s': %s", name, ", ".join(unknown))
+        log.warning("Ignoring unrecognized parameters in config section '%s': %s", name, ", ".join(unknown))
     return cls(**clean)
 
 
@@ -338,7 +332,7 @@ def config_from_dict(payload: Dict[str, Any]) -> RunConfig:
     run_name = payload.pop("run_name", "default")
     output_dir = payload.pop("output_dir", None)
     if payload:
-        log.warning("Ignoring unknown top-level config keys: %s", ", ".join(payload))
+        log.warning("Ignoring unrecognized top-level config keys: %s", ", ".join(payload))
 
     return RunConfig(run_name=run_name, output_dir=output_dir, **sections)
 
@@ -346,21 +340,18 @@ def config_from_dict(payload: Dict[str, Any]) -> RunConfig:
 def load_config(path: str | Path) -> RunConfig:
     path = Path(path).expanduser()
     if not path.exists():
-        # Allow `--config qwen3.5-2b` as shorthand for configs/qwen3.5-2b.yaml
         candidate = repo_root() / "configs" / f"{path.name}.yaml"
         if candidate.exists():
             path = candidate
         else:
-            raise FileNotFoundError(f"Config file not found: {path}")
+            raise FileNotFoundError(f"Configuration file not found: {path}")
 
     text = path.read_text(encoding="utf-8")
     if path.suffix in {".yaml", ".yml"}:
         try:
             import yaml
-        except ImportError as exc:  # pragma: no cover
-            raise ImportError(
-                "PyYAML is required to read YAML configs. Install with: pip install pyyaml"
-            ) from exc
+        except ImportError as exc:
+            raise ImportError("PyYAML is required to load YAML configs. Install with: pip install pyyaml") from exc
         payload = yaml.safe_load(text) or {}
     else:
         payload = json.loads(text)

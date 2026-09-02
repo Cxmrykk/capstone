@@ -1,8 +1,8 @@
-"""Environment introspection -- powers `python app.py doctor`.
+"""Environment diagnostics and system compatibility checks for `app.py doctor`.
 
-The point is to catch common failure modes in resource-constrained or Colab
-environments: no GPU, bf16 assumed on a T4, bitsandbytes missing, missing HF
-token, or unpulled dataset files.
+Verifies GPU accelerator availability, VRAM allocation, precision capabilities
+(such as fp16 on Nvidia Turing vs bf16 on Ampere+), Python dependencies,
+and Neo4j connectivity.
 """
 from __future__ import annotations
 
@@ -140,6 +140,7 @@ def _probe_neo4j() -> Dict[str, Any]:
 
 
 def environment_report(check_neo4j: bool = False) -> Dict[str, Any]:
+    """Collects comprehensive hardware, software, and dependency diagnostics."""
     report: Dict[str, Any] = {
         "python": sys.version.split()[0],
         "platform": platform.platform(),
@@ -180,37 +181,37 @@ def _warnings(r: Dict[str, Any]) -> List[str]:
     t = r["torch"]
 
     if not t["available"]:
-        warns.append("PyTorch is not installed -- training and HF inference are unavailable.")
+        warns.append("PyTorch is not installed -- training and PyTorch inference are unavailable.")
     elif not t["cuda"]:
-        warns.append("No CUDA device detected. Fine-tuning is not practical on CPU; consider using a GPU instance such as Colab.")
+        warns.append("No CUDA GPU detected. Model fine-tuning requires GPU acceleration.")
     else:
         if not t["bf16_supported"]:
             warns.append(
                 f"{t['device_name']} (sm_{t['capability']}) does not support bfloat16. "
-                "Training will run in fp16 -- this is expected on a T4 and handled automatically."
+                "The pipeline will use fp16 precision automatically."
             )
         if t["total_vram_gb"] and t["total_vram_gb"] < 20:
             warns.append(
-                f"Detected {t['total_vram_gb']} GB VRAM. Maintain 4-bit quantization, "
-                "gradient checkpointing, and small per-device batch sizes."
+                f"Detected {t['total_vram_gb']} GB VRAM. Use 4-bit quantization, "
+                "gradient checkpointing, and appropriate micro-batch sizes."
             )
 
     if r["packages"].get("bitsandbytes") == "MISSING" and t.get("cuda"):
-        warns.append("bitsandbytes is missing -- 4-bit QLoRA will not work.")
+        warns.append("bitsandbytes is not installed -- 4-bit QLoRA training is unavailable.")
     if r["packages"].get("peft") == "MISSING":
-        warns.append("peft is missing -- LoRA training will not work.")
+        warns.append("peft is not installed -- LoRA training is unavailable.")
     if r["packages"].get("neo4j") == "MISSING":
-        warns.append("The neo4j driver is missing -- execution-based evaluation is unavailable.")
+        warns.append("The neo4j driver is not installed -- execution-based evaluation is unavailable.")
 
     ds = r["dataset"]
     if not (ds["train_parquet"] and ds["test_parquet"]):
-        warns.append(f"Dataset parquet files not found under {ds['dir']}. Run ./download_data.sh")
+        warns.append(f"Dataset Parquet files missing from {ds['dir']}. Run ./download_data.sh")
 
     if not r["hf_token_present"]:
-        warns.append("No HF_TOKEN in the environment -- gated models and checkpoint sync will fail.")
+        warns.append("HF_TOKEN is not set -- gated model access and remote checkpoint sync may fail.")
 
     if not r["llama_cpp_dir"] and not r["binaries"].get("llama-cli"):
-        warns.append("llama.cpp not found -- run scripts/build_llama_cpp.sh before GGUF work.")
+        warns.append("llama.cpp not found -- run scripts/build_llama_cpp.sh before GGUF export.")
 
     return warns
 
@@ -220,13 +221,13 @@ def render_report(r: Dict[str, Any]) -> str:
     add = lines.append
 
     add("=" * 68)
-    add("  Text2Cypher -- environment report")
+    add("  Text2Cypher System Diagnostic Report")
     add("=" * 68)
     add(f"Python          : {r['python']}")
     add(f"Platform        : {r['platform']}")
-    add(f"Google Colab    : {'yes' if r['is_colab'] else 'no'}")
-    add(f"Repo root       : {r['repo_root']}")
-    add(f"Artifacts       : {r['artifacts_dir']}")
+    add(f"Environment     : {'Google Colab' if r['is_colab'] else 'Standalone / Local'}")
+    add(f"Repository Root : {r['repo_root']}")
+    add(f"Artifacts Dir   : {r['artifacts_dir']}")
     add("")
 
     t = r["torch"]
@@ -234,53 +235,53 @@ def render_report(r: Dict[str, Any]) -> str:
     if t["cuda"]:
         add(f"Device          : {t['device_name']} (sm_{t['capability']})")
         add(f"VRAM            : {t['total_vram_gb']} GB")
-        add(f"CUDA            : {t.get('cuda_version')}")
-        add(f"bfloat16        : {'supported' if t['bf16_supported'] else 'NOT supported'}")
-        add(f"Training dtype  : {t['recommended_dtype']}")
+        add(f"CUDA Version    : {t.get('cuda_version')}")
+        add(f"bfloat16        : {'Supported' if t['bf16_supported'] else 'Not Supported'}")
+        add(f"Training Dtype  : {t['recommended_dtype']}")
     else:
         add("Device          : CPU only")
     add("")
 
-    add("-- Packages -------------------------------------------------------")
+    add("-- Python Packages ------------------------------------------------")
     for name, ver in r["packages"].items():
         add(f"  {name:<22} {ver}")
     add("")
 
-    add("-- Dataset --------------------------------------------------------")
+    add("-- Dataset Status -------------------------------------------------")
     ds = r["dataset"]
-    add(f"  dir           : {ds['dir']}")
-    add(f"  train parquet : {'yes' if ds['train_parquet'] else 'NO'} "
-        f"({ds['train_size_mb']} MB)" if ds["train_parquet"] else "  train parquet : NO")
-    add(f"  test parquet  : {'yes' if ds['test_parquet'] else 'NO'} "
-        f"({ds['test_size_mb']} MB)" if ds["test_parquet"] else "  test parquet  : NO")
+    add(f"  Location      : {ds['dir']}")
+    add(f"  Train Split   : {'Present' if ds['train_parquet'] else 'MISSING'} "
+        f"({ds['train_size_mb']} MB)" if ds["train_parquet"] else "  Train Split   : MISSING")
+    add(f"  Test Split    : {'Present' if ds['test_parquet'] else 'MISSING'} "
+        f"({ds['test_size_mb']} MB)" if ds["test_parquet"] else "  Test Split    : MISSING")
     add("")
 
-    add("-- Base models ----------------------------------------------------")
+    add("-- Local Base Models ----------------------------------------------")
     for name, st in r["models"].items():
-        state = "weights present" if st["has_weights"] else (
-            "directory only (submodule not pulled)" if st["dir_exists"] else "absent")
+        state = "Weights Present" if st["has_weights"] else (
+            "Directory Exists (No Weights)" if st["dir_exists"] else "Not Found")
         add(f"  {name:<16} {state}")
     add("")
 
-    add("-- Tooling --------------------------------------------------------")
+    add("-- Tools & Services -----------------------------------------------")
     for name, path in r["binaries"].items():
         add(f"  {name:<16} {path or '-'}")
-    add(f"  llama.cpp dir  : {r['llama_cpp_dir'] or '-'}")
-    add(f"  neo4j service  : {r['neo4j_service']}")
-    add(f"  HF_TOKEN       : {'set' if r['hf_token_present'] else 'NOT SET'}")
+    add(f"  llama.cpp      : {r['llama_cpp_dir'] or '-'}")
+    add(f"  Neo4j Service  : {r['neo4j_service']}")
+    add(f"  HF_TOKEN       : {'Configured' if r['hf_token_present'] else 'NOT CONFIGURED'}")
     add("")
 
     if "neo4j_probe" in r:
-        add("-- Neo4j connectivity ---------------------------------------------")
+        add("-- Neo4j Connectivity ---------------------------------------------")
         for alias, status in r["neo4j_probe"].items():
             add(f"  {alias:<32} {status}")
         add("")
 
     if r["warnings"]:
-        add("-- Warnings -------------------------------------------------------")
+        add("-- Diagnostics Warnings -------------------------------------------")
         for w in r["warnings"]:
             add(f"  ! {w}")
     else:
-        add("No warnings. Environment looks ready.")
+        add("Diagnostics passed without warnings. Environment is ready.")
     add("=" * 68)
     return "\n".join(lines)

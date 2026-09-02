@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Text2Cypher toolkit: fine-tuning and evaluating lightweight LLMs for graph databases.
+Text2Cypher Toolkit: Fine-tuning and evaluating lightweight LLMs for graph databases.
 
 Usage:
     python app.py doctor
@@ -19,7 +19,7 @@ import os
 import sys
 from pathlib import Path
 
-# Make `src` importable regardless of the working directory.
+# Ensure root directory is on sys.path
 _REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -30,104 +30,104 @@ log = get_logger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Argument parsing
+# CLI Parser Setup
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="app.py",
-        description="Text2Cypher toolkit: fine-tuning and evaluating lightweight LLMs for graph databases.",
+        description="Text2Cypher Toolkit: Fine-tuning and evaluating lightweight LLMs for graph databases.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-v", "--verbose", action="store_true", help="Debug-level logging.")
-    p.add_argument("--quiet", action="store_true", help="Warnings and errors only.")
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging.")
+    p.add_argument("--quiet", action="store_true", help="Show warnings and errors only.")
 
     sub = p.add_subparsers(dest="command", required=True)
 
     # ---- doctor ----------------------------------------------------------- #
-    d = sub.add_parser("doctor", help="Report on the local/Colab environment.")
-    d.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
-    d.add_argument("--check-neo4j", action="store_true", help="Also probe Neo4j connectivity.")
+    d = sub.add_parser("doctor", help="Run system diagnostics and verify environment requirements.")
+    d.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+    d.add_argument("--check-neo4j", action="store_true", help="Test remote Neo4j demo database connectivity.")
 
     # ---- data ------------------------------------------------------------- #
-    data = sub.add_parser("data", help="Dataset inspection and preparation.")
+    data = sub.add_parser("data", help="Inspect and preview dataset splits and token distributions.")
     data_sub = data.add_subparsers(dest="data_command", required=True)
 
-    ds_stats = data_sub.add_parser("stats", help="Summarise the dataset splits.")
+    ds_stats = data_sub.add_parser("stats", help="Display dataset statistics.")
     ds_stats.add_argument("--dataset-dir", default=None)
 
-    ds_prev = data_sub.add_parser("preview", help="Render a fully-formatted training example.")
+    ds_prev = data_sub.add_parser("preview", help="Preview a formatted prompt-target example.")
     ds_prev.add_argument("--config", default=None)
     ds_prev.add_argument("--index", type=int, default=0)
     ds_prev.add_argument("--split", default="train", choices=["train", "test"])
     ds_prev.add_argument("--schema-mode", default=None)
     ds_prev.add_argument("--no-tokenizer", action="store_true",
-                         help="Skip loading the tokenizer (shows the raw prompt body only).")
+                         help="Render prompt text without loading tokenizer.")
 
-    ds_tok = data_sub.add_parser("token-stats", help="Token-length distribution for a schema mode.")
+    ds_tok = data_sub.add_parser("token-stats", help="Calculate sequence length distribution for a schema mode.")
     ds_tok.add_argument("--config", required=True)
     ds_tok.add_argument("--schema-mode", default=None)
     ds_tok.add_argument("--samples", type=int, default=1000)
 
     # ---- train ------------------------------------------------------------ #
-    t = sub.add_parser("train", help="LoRA fine-tuning with Hub checkpoint sync.")
+    t = sub.add_parser("train", help="Execute LoRA fine-tuning with remote checkpointing.")
     t.add_argument("--config", required=True)
     t.add_argument("--run-name", default=None)
     t.add_argument("--resume", default="auto", choices=["auto", "hub", "local", "none"])
     t.add_argument("--max-steps", type=int, default=None)
     t.add_argument("--time-limit", type=float, default=None,
-                   help="Stop and checkpoint after N minutes (useful for Colab session budgets).")
+                   help="Halt and checkpoint after N minutes for session limit management.")
     t.add_argument("--schema-mode", default=None)
     t.add_argument("--max-train-samples", type=int, default=None)
     t.add_argument("--hub-repo", default=None)
-    t.add_argument("--no-hub", action="store_true", help="Disable Hub checkpoint sync.")
+    t.add_argument("--no-hub", action="store_true", help="Disable remote Hub checkpoint synchronization.")
     t.add_argument("--output-dir", default=None)
 
     # ---- predict ---------------------------------------------------------- #
-    pr = sub.add_parser("predict", help="Generate Cypher for an evaluation split.")
+    pr = sub.add_parser("predict", help="Generate Cypher queries for an evaluation split.")
     pr.add_argument("--config", required=True)
     pr.add_argument("--backend", default="hf", choices=["hf", "llamacpp"])
-    pr.add_argument("--adapter", default=None, help="Path to a LoRA adapter directory.")
+    pr.add_argument("--adapter", default=None, help="Path to LoRA adapter weights directory.")
     pr.add_argument("--model-path", default=None, help="Override base/merged model path.")
-    pr.add_argument("--gguf", default=None, help="GGUF file (llamacpp backend).")
-    pr.add_argument("--server-url", default=None, help="Existing llama-server URL.")
+    pr.add_argument("--gguf", default=None, help="Path to GGUF model file (for llamacpp backend).")
+    pr.add_argument("--server-url", default=None, help="Existing llama-server HTTP endpoint.")
     pr.add_argument("--split", default="test", choices=["train", "test"])
     pr.add_argument("--limit", type=int, default=None)
     pr.add_argument("--schema-mode", default=None)
     pr.add_argument("--batch-size", type=int, default=None)
     pr.add_argument("--max-new-tokens", type=int, default=None)
     pr.add_argument("--out", default=None)
-    pr.add_argument("--tag", default=None, help="Label recorded in the output file.")
+    pr.add_argument("--tag", default=None, help="Run tag recorded in metadata.")
 
     # ---- evaluate --------------------------------------------------------- #
-    e = sub.add_parser("evaluate", help="Score a predictions file.")
+    e = sub.add_parser("evaluate", help="Score prediction outputs across translation and execution metrics.")
     e.add_argument("--predictions", required=True, nargs="+")
-    e.add_argument("--execute", action="store_true", help="Run execution-based evaluation.")
-    e.add_argument("--validate-syntax", action="store_true", help="EXPLAIN every query.")
+    e.add_argument("--execute", action="store_true", help="Execute queries against target Neo4j databases.")
+    e.add_argument("--validate-syntax", action="store_true", help="Validate query syntax via EXPLAIN clauses.")
     e.add_argument("--provider", default=None, choices=["demo", "local"])
-    e.add_argument("--only-db", default=None, help="Restrict execution to one database alias.")
+    e.add_argument("--only-db", default=None, help="Restrict execution to a specific database alias.")
     e.add_argument("--limit", type=int, default=None)
     e.add_argument("--out", default=None)
-    e.add_argument("--no-cache", action="store_true")
+    e.add_argument("--no-cache", action="store_true", help="Bypass local query result cache.")
 
     # ---- export ----------------------------------------------------------- #
-    x = sub.add_parser("export", help="Merge adapters and convert to GGUF.")
+    x = sub.add_parser("export", help="Merge LoRA adapters and convert to quantized GGUF format.")
     x_sub = x.add_subparsers(dest="export_command", required=True)
 
-    xm = x_sub.add_parser("merge", help="Merge a LoRA adapter into fp16 base weights.")
+    xm = x_sub.add_parser("merge", help="Merge LoRA adapter into full-precision base weights.")
     xm.add_argument("--config", required=True)
     xm.add_argument("--adapter", required=True)
     xm.add_argument("--out", default=None)
     xm.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
 
-    xg = x_sub.add_parser("gguf", help="Convert merged weights to GGUF and quantise.")
+    xg = x_sub.add_parser("gguf", help="Convert merged model weights to quantized GGUF format.")
     xg.add_argument("--merged", required=True)
     xg.add_argument("--out-dir", default=None)
     xg.add_argument("--quant", default="Q4_K_M")
-    xg.add_argument("--llama-cpp", default=None, help="Path to a llama.cpp checkout.")
-    xg.add_argument("--keep-f16", action="store_true", help="Keep the intermediate f16 GGUF.")
+    xg.add_argument("--llama-cpp", default=None, help="Path to llama.cpp build directory.")
+    xg.add_argument("--keep-f16", action="store_true", help="Retain intermediate f16 GGUF file.")
 
     # ---- checkpoint ------------------------------------------------------- #
-    c = sub.add_parser("checkpoint", help="Inspect/move checkpoints on the Hub.")
+    c = sub.add_parser("checkpoint", help="Manage remote checkpoints on Hugging Face Hub.")
     c_sub = c.add_subparsers(dest="checkpoint_command", required=True)
 
     cl = c_sub.add_parser("list", help="List remote checkpoints for a run.")
@@ -140,27 +140,27 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--step", default="latest")
     cp.add_argument("--dest", default=None)
 
-    cu = c_sub.add_parser("push", help="Upload a local checkpoint directory.")
+    cu = c_sub.add_parser("push", help="Upload a local checkpoint directory to the Hub.")
     cu.add_argument("--config", required=True)
     cu.add_argument("--path", required=True)
     cu.add_argument("--run-name", default=None)
 
     # ---- neo4j ------------------------------------------------------------ #
-    n = sub.add_parser("neo4j", help="Neo4j connectivity helpers.")
+    n = sub.add_parser("neo4j", help="Neo4j connectivity and schema utility helpers.")
     n_sub = n.add_subparsers(dest="neo4j_command", required=True)
 
-    nc = n_sub.add_parser("check", help="Probe a database alias.")
+    nc = n_sub.add_parser("check", help="Probe connectivity to a target database alias.")
     nc.add_argument("--alias", default="neo4jlabs_demo_db_movies")
     nc.add_argument("--provider", default=None, choices=["demo", "local"])
 
-    nl = n_sub.add_parser("aliases", help="List database aliases present in the dataset.")
+    nl = n_sub.add_parser("aliases", help="List all database aliases present in the dataset.")
     nl.add_argument("--dataset-dir", default=None)
 
     return p
 
 
 # --------------------------------------------------------------------------- #
-# Command dispatch
+# Command Dispatchers
 # --------------------------------------------------------------------------- #
 def cmd_doctor(args) -> int:
     from src.env import environment_report, render_report
@@ -197,7 +197,7 @@ def cmd_data(args) -> int:
         print(token_length_stats(cfg, n_samples=args.samples))
         return 0
 
-    raise SystemExit(f"Unknown data command: {args.data_command}")
+    raise SystemExit(f"Unknown data subcommand: {args.data_command}")
 
 
 def cmd_train(args) -> int:
@@ -278,7 +278,7 @@ def cmd_export(args) -> int:
 
         cfg = load_config(args.config)
         out = merge_adapter(cfg, adapter_path=args.adapter, out_dir=args.out, dtype=args.dtype)
-        log.info("Merged model written to %s", out)
+        log.info("Merged model saved to %s", out)
         return 0
 
     if args.export_command == "gguf":
@@ -291,10 +291,10 @@ def cmd_export(args) -> int:
             llama_cpp_dir=args.llama_cpp,
             keep_f16=args.keep_f16,
         )
-        log.info("GGUF written to %s", out)
+        log.info("GGUF model saved to %s", out)
         return 0
 
-    raise SystemExit(f"Unknown export command: {args.export_command}")
+    raise SystemExit(f"Unknown export subcommand: {args.export_command}")
 
 
 def cmd_checkpoint(args) -> int:
@@ -316,7 +316,7 @@ def cmd_checkpoint(args) -> int:
         latest = sync.read_latest_marker()
         if latest:
             print(f"\nLATEST marker -> step {latest.get('step')} "
-                  f"(written {latest.get('written_at')})")
+                  f"(timestamp: {latest.get('written_at')})")
         return 0
 
     if args.checkpoint_command == "pull":
@@ -332,7 +332,7 @@ def cmd_checkpoint(args) -> int:
         print(f"Uploaded {path} as checkpoint-{step}")
         return 0
 
-    raise SystemExit(f"Unknown checkpoint command: {args.checkpoint_command}")
+    raise SystemExit(f"Unknown checkpoint subcommand: {args.checkpoint_command}")
 
 
 def _infer_step_from_dirname(path: Path) -> int:
@@ -362,17 +362,16 @@ def cmd_neo4j(args) -> int:
             cfg.neo4j.provider = args.provider
         target = resolve_target(args.alias, cfg.neo4j)
         if target is None:
-            print(f"Could not resolve alias '{args.alias}' under provider "
-                  f"'{cfg.neo4j.provider}'.")
+            print(f"Could not resolve alias '{args.alias}' for provider '{cfg.neo4j.provider}'.")
             return 1
-        print(f"Resolved -> uri={target.uri} database={target.database} user={target.user}")
+        print(f"Target -> URI={target.uri}, Database={target.database}, User={target.user}")
         executor = Neo4jExecutor(cfg.neo4j, use_cache=False)
         ok, detail = executor.ping(target)
         executor.close()
-        print("Reachable" if ok else f"Unreachable: {detail}")
+        print("Status: Reachable" if ok else f"Status: Unreachable ({detail})")
         return 0 if ok else 1
 
-    raise SystemExit(f"Unknown neo4j command: {args.neo4j_command}")
+    raise SystemExit(f"Unknown neo4j subcommand: {args.neo4j_command}")
 
 
 DISPATCH = {
@@ -394,7 +393,6 @@ def main(argv=None) -> int:
     level = "DEBUG" if args.verbose else ("WARNING" if args.quiet else "INFO")
     setup_logging(level)
 
-    # Quieter, more predictable HF behaviour by default.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
@@ -402,7 +400,7 @@ def main(argv=None) -> int:
     try:
         return handler(args)
     except KeyboardInterrupt:
-        log.warning("Interrupted by user.")
+        log.warning("Process interrupted by user.")
         return 130
 
 

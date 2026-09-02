@@ -1,1 +1,1 @@
-"""Adapter merging and GGUF conversion for local (laptop) inference."""
+"""Adapter merging and GGUF conversion for local / edge inference."""

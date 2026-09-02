@@ -1,16 +1,8 @@
-"""Model and tokenizer loading.
+"""Model initialization, tokenizer configuration, and LoRA target module discovery.
 
-Design notes:
-
-* Unsloth is tried first for acceleration but is not required. New architectures
-  frequently lag Unsloth support, and a fallback to Transformers+PEFT ensures
-  resilience on Colab sessions.
-* dtype is chosen from the device, never hardcoded. A T4 reports
-  bf16_supported == False and we fall back to fp16 automatically.
-* LoRA target modules are discovered by walking the module tree rather than
-  hardcoding names, because Qwen3.5's linear-attention blocks and Gemma 4's
-  per-layer-embedding blocks do not use the familiar q_proj/k_proj naming
-  throughout. Vision/audio towers are excluded.
+Handles device-aware precision selection (detecting fp16 on Nvidia Turing T4 vs
+bf16 on Ampere+ architectures), automatic discovery of linear projection layers
+for LoRA parameter injection, and optional acceleration via Unsloth.
 """
 from __future__ import annotations
 
@@ -25,9 +17,10 @@ log = get_logger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# dtype selection
+# Precision & Compute Dtype Selection
 # --------------------------------------------------------------------------- #
 def select_dtype():
+    """Selects the optimal torch compute dtype based on hardware capabilities."""
     import torch
 
     if not torch.cuda.is_available():
@@ -43,7 +36,7 @@ def select_dtype():
 
 
 def dtype_flags() -> Dict[str, bool]:
-    """TrainingArguments flags matching the selected dtype."""
+    """Returns TrainingArguments precision flags corresponding to the selected dtype."""
     import torch
 
     dtype = select_dtype()
@@ -54,7 +47,6 @@ def dtype_flags() -> Dict[str, bool]:
 
 
 def _dtype_kwarg(dtype) -> Dict[str, Any]:
-    """`torch_dtype` was renamed to `dtype` in recent transformers."""
     try:
         from transformers import AutoModelForCausalLM
         params = inspect.signature(AutoModelForCausalLM.from_pretrained).parameters
@@ -66,9 +58,10 @@ def _dtype_kwarg(dtype) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Tokenizer
+# Tokenizer Loader
 # --------------------------------------------------------------------------- #
 def load_tokenizer(cfg: RunConfig, padding_side: str = "right"):
+    """Loads and configures the model tokenizer."""
     from transformers import AutoTokenizer
 
     path = cfg.model.resolved_path()
@@ -78,7 +71,7 @@ def load_tokenizer(cfg: RunConfig, padding_side: str = "right"):
             path, trust_remote_code=cfg.model.trust_remote_code
         )
     except Exception as exc:
-        log.debug("AutoTokenizer failed (%s); trying AutoProcessor.", exc)
+        log.debug("AutoTokenizer failed (%s); attempting AutoProcessor fallback.", exc)
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(
@@ -86,24 +79,24 @@ def load_tokenizer(cfg: RunConfig, padding_side: str = "right"):
         )
         tokenizer = getattr(processor, "tokenizer", None)
         if tokenizer is None:
-            raise RuntimeError(f"Could not obtain a tokenizer from {path}") from exc
+            raise RuntimeError(f"Could not load tokenizer from {path}") from exc
 
     if tokenizer.pad_token_id is None:
         if getattr(tokenizer, "unk_token", None) is not None:
             tokenizer.pad_token = tokenizer.unk_token
         else:
             tokenizer.pad_token = tokenizer.eos_token
-        log.info("Tokenizer had no pad token; using %r.", tokenizer.pad_token)
+        log.info("Tokenizer has no pad token; defaulting to %r.", tokenizer.pad_token)
 
     tokenizer.padding_side = padding_side
     return tokenizer
 
 
 # --------------------------------------------------------------------------- #
-# LoRA target discovery
+# LoRA Target Module Resolution
 # --------------------------------------------------------------------------- #
 def discover_lora_targets(model, exclude_substrings: List[str]) -> List[str]:
-    """Collect leaf names of all linear layers eligible for adaptation."""
+    """Discovers recurring linear module layer names for LoRA adaptation."""
     import torch.nn as nn
 
     linear_types: Tuple[type, ...] = (nn.Linear,)
@@ -127,15 +120,14 @@ def discover_lora_targets(model, exclude_substrings: List[str]) -> List[str]:
 
     if not names:
         raise RuntimeError(
-            "No eligible linear layers found for LoRA. Inspect the module tree "
-            "and set lora.target_modules explicitly in the config."
+            "No eligible linear projection modules found for LoRA. "
+            "Inspect the architecture tree and specify lora.target_modules explicitly."
         )
 
-    # Drop one-off layers (projectors, adapters) that appear only once or twice;
-    # we want the repeated transformer-block projections.
+    # Filter out single-instance projection layers; keep recurring transformer projections
     repeated = [n for n, c in names.items() if c >= 2] or list(names)
     ordered = sorted(repeated, key=lambda n: (-names[n], n))
-    log.info("Discovered %d LoRA target module names: %s",
+    log.info("Identified %d LoRA target projection layers: %s",
              len(ordered), ", ".join(ordered))
     return ordered
 
@@ -150,7 +142,7 @@ def resolve_target_modules(model, cfg: RunConfig):
 
 
 # --------------------------------------------------------------------------- #
-# Base model
+# Base Model Loading
 # --------------------------------------------------------------------------- #
 def _quant_config(cfg: RunConfig):
     import torch
@@ -211,27 +203,25 @@ def _load_base_model(cfg: RunConfig, quantize: bool, dtype, for_training: bool):
         except Exception as exc:
             last_error = exc
             log.debug("%s failed for %s: %s", class_name, path, exc)
-            # An unsupported attn implementation is a common, recoverable cause.
             if "attn_implementation" in str(exc) or "flash" in str(exc).lower():
                 kwargs["attn_implementation"] = "eager"
 
     raise RuntimeError(
-        f"Could not load model from {path}. Last error: {last_error}\n"
-        "If this is a very new architecture, upgrade transformers "
-        "(pip install -U transformers) or set model.trust_remote_code: true."
+        f"Failed to load model from {path}. Last error: {last_error}\n"
+        "Ensure transformers is updated or set model.trust_remote_code: true."
     )
 
 
 def _try_unsloth(cfg: RunConfig, for_training: bool):
-    """Attempt the Unsloth fast path; return None if unavailable/unsupported."""
+    """Attempts Unsloth acceleration; returns None if unsupported or unavailable."""
     if cfg.model.use_unsloth == "no":
         return None
     try:
         from unsloth import FastLanguageModel
     except Exception as exc:
         if cfg.model.use_unsloth == "yes":
-            raise RuntimeError(f"use_unsloth=yes but unsloth is unimportable: {exc}") from exc
-        log.info("Unsloth not available (%s); using transformers + peft.", type(exc).__name__)
+            raise RuntimeError(f"use_unsloth=yes but unsloth could not be imported: {exc}") from exc
+        log.info("Unsloth unavailable (%s); proceeding with standard Transformers + PEFT.", type(exc).__name__)
         return None
 
     import torch
@@ -240,16 +230,16 @@ def _try_unsloth(cfg: RunConfig, for_training: bool):
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=cfg.model.resolved_path(),
             max_seq_length=cfg.data.max_seq_length,
-            dtype=None,                       # Unsloth auto-detects; picks fp16 on T4
+            dtype=None,
             load_in_4bit=cfg.model.load_in_4bit,
             trust_remote_code=cfg.model.trust_remote_code,
         )
-        log.info("Loaded via Unsloth.")
+        log.info("Loaded model via Unsloth acceleration engine.")
         return model, tokenizer
     except Exception as exc:
         if cfg.model.use_unsloth == "yes":
             raise
-        log.warning("Unsloth could not load %s (%s). Falling back to transformers + peft.",
+        log.warning("Unsloth acceleration failed for %s (%s). Falling back to Transformers + PEFT.",
                     cfg.model.key, exc)
         try:
             torch.cuda.empty_cache()
@@ -261,7 +251,7 @@ def _try_unsloth(cfg: RunConfig, for_training: bool):
 def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
                              adapter_path: Optional[str] = None,
                              model_path_override: Optional[str] = None):
-    """Return (model, tokenizer, meta)."""
+    """Initializes and returns (model, tokenizer, metadata)."""
     import torch
 
     if model_path_override:
@@ -301,7 +291,7 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
     if adapter_path:
         from peft import PeftModel
 
-        log.info("Attaching LoRA adapter from %s", adapter_path)
+        log.info("Loading LoRA adapter weights from %s", adapter_path)
         model = PeftModel.from_pretrained(model, adapter_path, is_trainable=for_training)
         meta["adapter"] = adapter_path
         _finalise(model, tokenizer, cfg, for_training)
@@ -343,16 +333,11 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
 
 
 def _finalise(model, tokenizer, cfg: RunConfig, for_training: bool) -> None:
-    """Common post-load fixes."""
     try:
-        if for_training:
-            model.config.use_cache = False
-        else:
-            model.config.use_cache = True
+        model.config.use_cache = not for_training
     except Exception:
         pass
 
-    # Keep generation config consistent with the tokenizer.
     try:
         gen_cfg = getattr(model, "generation_config", None)
         if gen_cfg is not None:

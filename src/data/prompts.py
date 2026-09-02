@@ -1,7 +1,7 @@
-"""Prompt construction and output parsing.
+"""Prompt formatting, chat template rendering, and Cypher statement extraction.
 
-Instruction text follows Ozsoy et al. (2025), Table 3, to maintain comparability
-with published benchmarks for the text2cypher-2024v1 dataset.
+Constructs consistent instruction prompts for Text2Cypher tasks across different
+model tokenizer formats and provides robust regex extractors for generated outputs.
 """
 from __future__ import annotations
 
@@ -32,10 +32,10 @@ USER_TEMPLATE = (
 
 def build_messages(question: str, schema: str,
                    supports_system_role: bool = True) -> List[Dict[str, str]]:
-    """Build a chat-format prompt.
+    """Builds a structured list of chat messages.
 
-    Gemma-family templates reject a `system` role, so the instruction is folded
-    into the leading user turn instead. The token content is equivalent.
+    For model families whose chat templates reject a distinct system turn (such
+    as Gemma), the system instruction is prepended to the initial user prompt.
     """
     user = USER_TEMPLATE.format(schema=schema or "", question=question or "")
     if supports_system_role:
@@ -47,7 +47,7 @@ def build_messages(question: str, schema: str,
 
 
 def template_supports_system(tokenizer) -> bool:
-    """Probe whether the tokenizer's chat template accepts a system role."""
+    """Probes whether the tokenizer chat template accepts a system role."""
     try:
         tokenizer.apply_chat_template(
             [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
@@ -60,6 +60,7 @@ def template_supports_system(tokenizer) -> bool:
 
 
 def template_supports_thinking(tokenizer) -> bool:
+    """Checks whether the Jinja chat template supports reasoning control flags."""
     src = getattr(tokenizer, "chat_template", None)
     if not isinstance(src, str):
         return False
@@ -73,18 +74,14 @@ def render_prompt(
     supports_system_role: Optional[bool] = None,
     chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Render the final prompt string, including the generation prefix.
+    """Renders the final formatted prompt string with the generation prefix.
 
-    Both the HF and llama.cpp backends call this, guaranteeing byte-identical
-    prompts across backends for consistent evaluation.
+    Ensures identical prompt construction across both PyTorch and GGUF inference engines.
     """
     if supports_system_role is None:
         supports_system_role = template_supports_system(tokenizer)
 
     kwargs = dict(chat_template_kwargs or {})
-    # Only forward enable_thinking if the template actually reads it; passing it
-    # to a template that does not is harmless but noisy, and some strict
-    # templates raise on unexpected kwargs.
     if "enable_thinking" in kwargs and not template_supports_thinking(tokenizer):
         kwargs.pop("enable_thinking")
 
@@ -96,21 +93,21 @@ def render_prompt(
                 messages, tokenize=False, add_generation_prompt=True, **kwargs
             )
         except Exception as exc:
-            log.debug("apply_chat_template failed (%s); retrying without kwargs.", exc)
+            log.debug("apply_chat_template failed with kwargs (%s); retrying without kwargs.", exc)
             try:
                 return tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
             except Exception as exc2:
-                log.warning("Chat template unusable (%s); falling back to plain text.", exc2)
+                log.warning("Chat template unusable (%s); falling back to plain text formatting.", exc2)
 
-    # Plain-text fallback for base models with no chat template.
+    # Plain text fallback for base models lacking a dedicated chat template
     body = "\n\n".join(m["content"] for m in messages)
     return f"{body}\n"
 
 
 # --------------------------------------------------------------------------- #
-# Output parsing
+# Output Extraction
 # --------------------------------------------------------------------------- #
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _UNCLOSED_THINK = re.compile(r"^.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -127,9 +124,10 @@ _STOP_MARKERS = ("<|im_end|>", "<end_of_turn>", "<|endoftext|>", "<eos>", "<|eot
 
 
 def extract_cypher(raw: str) -> str:
-    """Pull a single Cypher statement out of a model response.
+    """Extracts a clean Cypher query string from raw model text generation.
 
-    Handles reasoning blocks, code fences, lead-in phrases and trailing prose.
+    Handles reasoning blocks (<think>), markdown code blocks, lead-in prefixes,
+    and trailing explanatory sentences.
     """
     if not raw:
         return ""
@@ -140,20 +138,20 @@ def extract_cypher(raw: str) -> str:
         if idx != -1:
             text = text[:idx]
 
-    # Reasoning traces.
+    # Strip thinking/reasoning blocks
     text = _THINK_BLOCK.sub(" ", text)
     if "</think>" in text.lower():
         text = _UNCLOSED_THINK.sub("", text, count=1)
     text = text.replace("<think>", " ")
 
-    # Fenced code wins if present.
+    # Extract markdown code fence if present
     fence = _FENCE.search(text)
     if fence:
         text = fence.group(1)
 
     text = _LEADIN.sub("", text.strip())
 
-    # Keep contiguous blocks; drop trailing explanation paragraphs.
+    # Locate contiguous code block starting with valid Cypher keywords
     blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
     if not blocks:
         return ""
@@ -165,8 +163,7 @@ def extract_cypher(raw: str) -> str:
             chosen = block
             break
 
-    # Strip stray leading backticks/quotes the model may emit.
+    # Strip stray quotes, backticks, and trailing semicolons for consistency
     chosen = chosen.strip().strip("`").strip()
-    # Drop a trailing semicolon so string comparison is not penalised by style.
     chosen = chosen.rstrip().rstrip(";").rstrip()
     return chosen

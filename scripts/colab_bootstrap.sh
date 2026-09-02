@@ -2,8 +2,8 @@
 #
 # One-shot Colab setup. Run from a cell:
 #
-#   !git clone https://github.com/<you>/<repo>.git /content/capstone
-#   %cd /content/capstone
+#   !git clone https://github.com/<you>/<repo>.git /content/text2cypher
+#   %cd /content/text2cypher
 #   !bash scripts/colab_bootstrap.sh
 #
 # Then set your token and start training:
@@ -45,7 +45,7 @@ Before training, set a WRITE token so checkpoints survive a session loss:
 And set hub.repo_id in your config (or export T2C_HUB_REPO), e.g.
 
   hub:
-    repo_id: your-username/t2c-capstone-checkpoints
+    repo_id: your-username/text2cypher-checkpoints
 
 Datasets/models: the base weights download automatically from the Hub on first
 use. To pre-fetch them into data/ instead, run ./download_data.sh.

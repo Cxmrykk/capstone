@@ -1,8 +1,8 @@
-"""Merge a LoRA adapter into full-precision base weights.
+"""LoRA adapter merging into unquantized base model weights.
 
-A 4-bit base cannot be merged losslessly, so the base is reloaded in fp16 and
-the adapter is merged on top. For a 4B model this requires ~8 GB plus save buffer
-memory; it is recommended to run this on a GPU instance (e.g. Colab) before exporting.
+Loads the unquantized base model in full or half precision (fp16/bf16),
+applies the trained PEFT adapter weights, merges them in-place, and exports
+a standalone Hugging Face model directory ready for inference or GGUF conversion.
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ _DTYPES = {"float16": "float16", "bfloat16": "bfloat16", "float32": "float32"}
 
 def merge_adapter(cfg: RunConfig, adapter_path: str, out_dir: Optional[str] = None,
                   dtype: str = "float16") -> Path:
+    """Merges a LoRA adapter into full-precision base weights."""
     import torch
     from peft import PeftModel
 
@@ -35,8 +36,7 @@ def merge_adapter(cfg: RunConfig, adapter_path: str, out_dir: Optional[str] = No
     out = Path(out_dir) if out_dir else merged_dir() / f"{cfg.run_name}-merged"
     out.mkdir(parents=True, exist_ok=True)
 
-    log.info("Loading base model in %s (no quantisation) ...", dtype)
-    # Force the un-quantised path; merging into NF4 weights is lossy.
+    log.info("Loading base model in %s precision...", dtype)
     original_4bit = cfg.model.load_in_4bit
     cfg.model.load_in_4bit = False
     try:
@@ -44,20 +44,20 @@ def merge_adapter(cfg: RunConfig, adapter_path: str, out_dir: Optional[str] = No
     finally:
         cfg.model.load_in_4bit = original_4bit
 
-    log.info("Applying adapter from %s ...", adapter)
+    log.info("Attaching LoRA adapter from %s ...", adapter)
     model = PeftModel.from_pretrained(model, str(adapter), torch_dtype=torch_dtype)
 
-    log.info("Merging LoRA weights into the base ...")
+    log.info("Merging adapter weights into base model layers...")
     model = model.merge_and_unload()
     model = model.to(torch_dtype)
 
-    log.info("Saving merged weights to %s ...", out)
+    log.info("Saving merged model to %s ...", out)
     model.save_pretrained(str(out), safe_serialization=True, max_shard_size="4GB")
 
     tokenizer = load_tokenizer(cfg)
     tokenizer.save_pretrained(str(out))
 
-    # Copy anything the converter may want (chat template, processor config).
+    # Copy tokenizer templates and processor configurations
     base_path = Path(cfg.model.resolved_path())
     if base_path.exists():
         for name in ("chat_template.jinja", "preprocessor_config.json",
@@ -81,5 +81,5 @@ def merge_adapter(cfg: RunConfig, adapter_path: str, out_dir: Optional[str] = No
     except Exception:
         pass
 
-    log.info("Merge complete: %s", out)
+    log.info("Model merge successfully completed: %s", out)
     return out

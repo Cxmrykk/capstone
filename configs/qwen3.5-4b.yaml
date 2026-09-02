@@ -1,3 +1,5 @@
+# Configuration: Qwen3.5-4B with full annotated schema context.
+# Sized with smaller micro-batches and higher accumulation steps for 16 GB VRAM budgets.
 run_name: qwen3.5-4b-enhanced
 
 model:
@@ -26,11 +28,9 @@ train:
   learning_rate: 2.0e-4
   num_train_epochs: 1
   max_steps: -1
-  # 4B in NF4 leaves less headroom on a T4; halve the micro-batch and double
-  # accumulation to keep the effective batch size at 16.
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 16
+  gradient_accumulation_steps: 16     # Effective batch size: 16
   warmup_ratio: 0.03
   lr_scheduler_type: cosine
   optim: paged_adamw_8bit

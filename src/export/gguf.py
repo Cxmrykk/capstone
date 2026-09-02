@@ -1,10 +1,7 @@
-"""GGUF conversion and quantisation via llama.cpp.
+"""GGUF export and quantization via llama.cpp tooling.
 
-Note: llama.cpp must already support the target model architecture. For recent
-architectures (such as per-layer embeddings or hybrid linear attention), if
-convert_hf_to_gguf.py does not recognize the architecture, fallback strategies
-include (a) updating the llama.cpp checkout to the latest commit, or (b) running
-the merged fp16 weights directly via the Transformers backend on CPU.
+Converts merged Hugging Face model weights to GGUF format and applies k-quantization
+(e.g., Q4_K_M, Q5_K_M) for efficient CPU and edge device deployment.
 """
 from __future__ import annotations
 
@@ -28,6 +25,7 @@ QUANT_TYPES = [
 
 
 def find_llama_cpp_dir(override: Optional[str] = None) -> Optional[Path]:
+    """Finds the root directory of a compiled llama.cpp repository."""
     candidates: List[Path] = []
     if override:
         candidates.append(Path(override))
@@ -88,20 +86,20 @@ def convert_to_gguf(
     llama_cpp_dir: Optional[str] = None,
     keep_f16: bool = False,
 ) -> Path:
+    """Converts a merged Hugging Face model directory to a quantized GGUF file."""
     merged = Path(merged_dir)
     if not merged.exists():
         raise FileNotFoundError(f"Merged model directory not found: {merged}")
 
     if quant.upper() not in QUANT_TYPES and quant.upper() not in {"F16", "F32"}:
-        log.warning("Quantisation type %r is not in the known list %s; passing it through anyway.",
-                    quant, QUANT_TYPES)
+        log.warning("Quantization type %r is not standard; passing to llama-quantize directly.", quant)
 
     llama_dir = find_llama_cpp_dir(llama_cpp_dir)
     if llama_dir is None:
         raise RuntimeError(
-            "Could not find a llama.cpp checkout containing convert_hf_to_gguf.py.\n"
-            "Build it first:  bash scripts/build_llama_cpp.sh\n"
-            "or set LLAMA_CPP_DIR=/path/to/llama.cpp"
+            "Could not locate llama.cpp repository containing convert_hf_to_gguf.py.\n"
+            "Build with: bash scripts/build_llama_cpp.sh\n"
+            "or set LLAMA_CPP_DIR to an existing checkout."
         )
     log.info("Using llama.cpp at %s", llama_dir)
 
@@ -111,7 +109,7 @@ def convert_to_gguf(
     name = merged.name.replace("-merged", "")
     f16_path = out / f"{name}-f16.gguf"
 
-    log.info("Step 1/2: converting HF weights to f16 GGUF ...")
+    log.info("Step 1/2: Converting Hugging Face weights to f16 GGUF format...")
     try:
         _run([
             sys.executable,
@@ -123,28 +121,24 @@ def convert_to_gguf(
     except RuntimeError as exc:
         raise RuntimeError(
             f"{exc}\n\n"
-            "This usually indicates the llama.cpp converter does not yet support this architecture.\n"
+            "The llama.cpp converter may require an update for this model architecture.\n"
             "Options:\n"
-            "  1. Update checkout:  git -C "
-            f"{llama_dir} pull && bash scripts/build_llama_cpp.sh\n"
-            "  2. Check the architecture string in "
-            f"{merged / 'config.json'} against llama.cpp's supported list.\n"
-            "  3. Alternatively, evaluate the merged fp16 weights via the 'hf' backend on CPU:\n"
-            f"     python app.py predict --config <cfg> --backend hf "
-            f"--model-path {merged} --limit 50\n"
+            f"  1. Update repository: git -C {llama_dir} pull && bash scripts/build_llama_cpp.sh\n"
+            "  2. Evaluate the merged fp16 model using the 'hf' backend on CPU:\n"
+            f"     python app.py predict --config <cfg> --backend hf --model-path {merged} --limit 50\n"
         ) from exc
 
     if quant.upper() in {"F16", "F32"}:
-        log.info("Requested %s -- no quantisation step needed.", quant)
+        log.info("Requested %s precision; skipping quantization step.", quant)
         _write_sidecar(f16_path, merged, quant)
         return f16_path
 
-    log.info("Step 2/2: quantising to %s ...", quant)
+    log.info("Step 2/2: Quantizing weights to %s ...", quant)
     quantize_bin = _find_quantize_binary(llama_dir)
     if not quantize_bin:
         raise RuntimeError(
             f"llama-quantize binary not found under {llama_dir}. "
-            "Build llama.cpp: bash scripts/build_llama_cpp.sh"
+            "Build with: bash scripts/build_llama_cpp.sh"
         )
 
     quant_path = out / f"{name}-{quant.lower()}.gguf"
@@ -153,16 +147,15 @@ def convert_to_gguf(
     if not keep_f16:
         try:
             f16_path.unlink()
-            log.info("Removed intermediate f16 GGUF (pass --keep-f16 to retain it).")
+            log.info("Removed intermediate f16 GGUF file (pass --keep-f16 to retain it).")
         except Exception as exc:
-            log.warning("Could not remove %s: %s", f16_path, exc)
+            log.warning("Could not delete %s: %s", f16_path, exc)
 
     _write_sidecar(quant_path, merged, quant)
 
     size_gb = quant_path.stat().st_size / 1e9
-    log.info("GGUF ready: %s (%.2f GB)", quant_path, size_gb)
-    log.info("Test it with:\n  python app.py predict --config <cfg> --backend llamacpp "
-             f"--gguf {quant_path} --limit 50")
+    log.info("GGUF artifact ready: %s (%.2f GB)", quant_path, size_gb)
+    log.info("Test with:\n  python app.py predict --config <cfg> --backend llamacpp --gguf %s --limit 50", quant_path)
     return quant_path
 
 

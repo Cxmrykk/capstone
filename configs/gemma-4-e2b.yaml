@@ -3,8 +3,8 @@ run_name: gemma-4-e2b-enhanced
 model:
   key: gemma-4-e2b
   load_in_4bit: true
-  # Gemma configs carry final_logit_softcapping; eager attention is the safe
-  # implementation when softcapping is active (resolved from the ModelSpec).
+  # Gemma architectures utilize final logit soft-capping; eager attention is used
+  # to maintain numerical stability during training and inference.
   attn_implementation: auto
   use_unsloth: auto
 

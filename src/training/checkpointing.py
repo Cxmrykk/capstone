@@ -1,20 +1,8 @@
-"""Hub-backed checkpoint continuity for ephemeral or preemptible Colab sessions.
+"""Remote checkpoint synchronization and state recovery for ephemeral environments.
 
-The problem: a free-tier session can disconnect or reset at any time with a
-fresh filesystem. The solution is to treat a private HF model repo as the
-source of truth for training state.
-
-What gets uploaded on every save:
-    adapter_model.safetensors, adapter_config.json   (LoRA weights)
-    optimizer.pt, scheduler.pt, rng_state*.pth       (exact resume)
-    trainer_state.json, training_args.bin            (step/epoch bookkeeping)
-
-Because only LoRA parameters are trainable, the optimizer state is small, so a
-full checkpoint is typically tens to a few hundred MB rather than tens of GB.
-
-Atomicity: the LATEST.json marker is written *after* the folder upload
-succeeds, so a session killed mid-upload leaves the previous marker intact and
-resume falls back to the last complete checkpoint.
+Ensures training state continuity on preemptible GPU instances (such as Google Colab
+free sessions or cloud spot VMs) by synchronizing LoRA weights and optimizer states
+to a private Hugging Face Model Hub repository.
 """
 from __future__ import annotations
 
@@ -36,7 +24,6 @@ log = get_logger(__name__)
 
 _CHECKPOINT_RE = re.compile(r"checkpoint-(\d+)")
 
-# Never ship full base weights to the checkpoint repo; only adapters + state.
 _IGNORE_PATTERNS = [
     "*.gguf",
     "global_step*/*",
@@ -54,6 +41,7 @@ def _hf_token(cfg_env: str = "HF_TOKEN") -> Optional[str]:
 
 @dataclass
 class HubCheckpointSync:
+    """Manages background synchronization of adapter checkpoints to the Hugging Face Hub."""
     repo_id: str
     run_name: str
     token: Optional[str] = None
@@ -72,14 +60,13 @@ class HubCheckpointSync:
         if self.token is None:
             self.token = _hf_token()
 
-    # -- construction ----------------------------------------------------- #
     @classmethod
     def from_config(cls, cfg: RunConfig, run_name: Optional[str] = None) -> "HubCheckpointSync":
         repo_id = cfg.hub.repo_id or os.environ.get("T2C_HUB_REPO")
         if not repo_id:
             raise ValueError(
                 "No checkpoint repository configured. Set hub.repo_id in the config "
-                "(e.g. 'your-username/t2c-capstone-checkpoints') or export T2C_HUB_REPO."
+                "(e.g. 'username/text2cypher-checkpoints') or export T2C_HUB_REPO."
             )
         return cls(
             repo_id=repo_id,
@@ -92,7 +79,6 @@ class HubCheckpointSync:
             drive_mirror=cfg.hub.drive_mirror,
         )
 
-    # -- paths within the repo -------------------------------------------- #
     @property
     def run_prefix(self) -> str:
         return f"runs/{self.run_name}"
@@ -104,7 +90,6 @@ class HubCheckpointSync:
     def _latest_path(self) -> str:
         return f"{self.run_prefix}/LATEST.json"
 
-    # -- api -------------------------------------------------------------- #
     def _api(self):
         from huggingface_hub import HfApi
 
@@ -115,19 +100,19 @@ class HubCheckpointSync:
             return
         if not self.token:
             raise RuntimeError(
-                "No Hugging Face token found. Export HF_TOKEN (a write token) before "
-                "training, or pass --no-hub to disable checkpoint sync."
+                "No Hugging Face token found. Set HF_TOKEN with write permissions before "
+                "training, or disable checkpoint synchronization with --no-hub."
             )
         api = self._api()
         api.create_repo(repo_id=self.repo_id, repo_type="model",
                         private=self.private, exist_ok=True)
         self._repo_ready = True
-        log.info("Checkpoint repo ready: %s (private=%s, run=%s)",
+        log.info("Remote checkpoint repository verified: %s (private=%s, run=%s)",
                  self.repo_id, self.private, self.run_name)
 
-    # -- upload ----------------------------------------------------------- #
     def push(self, local_dir: str | Path, step: int, blocking: bool = False,
              extra_metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Pushes a saved checkpoint directory to the Hub repository."""
         if not self.enabled:
             return
         local_dir = Path(local_dir)
@@ -144,14 +129,12 @@ class HubCheckpointSync:
             self._do_push(local_dir, step, extra_metadata)
             return
 
-        # Serialise uploads: wait for any in-flight upload before starting a new
-        # one, so we never interleave commits to the same repo.
         self.wait()
         thread = threading.Thread(
             target=self._do_push,
             args=(local_dir, step, extra_metadata),
             name=f"hub-upload-{step}",
-            daemon=False,   # non-daemon: let it finish if the process exits cleanly
+            daemon=False,
         )
         self._thread = thread
         thread.start()
@@ -175,7 +158,6 @@ class HubCheckpointSync:
                     commit_message=f"[{self.run_name}] checkpoint-{step}",
                 )
 
-                # Marker written only after a successful folder commit.
                 marker = {
                     "run_name": self.run_name,
                     "step": step,
@@ -197,8 +179,7 @@ class HubCheckpointSync:
                 self.prune(keep_last=self.keep_last, protect_step=step)
 
             except Exception as exc:
-                # Never kill a training run over a failed upload.
-                log.error("Checkpoint upload for step %d failed: %s", step, exc)
+                log.error("Checkpoint upload failed for step %d: %s", step, exc)
 
     def _mirror_to_drive(self, local_dir: Path, step: int) -> None:
         try:
@@ -207,23 +188,22 @@ class HubCheckpointSync:
                 shutil.rmtree(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(local_dir, dest)
-            log.info("Mirrored checkpoint-%d to %s", step, dest)
+            log.info("Mirrored checkpoint-%d to local storage: %s", step, dest)
         except Exception as exc:
-            log.warning("Drive mirror failed: %s", exc)
+            log.warning("Local storage mirror failed: %s", exc)
 
     def wait(self, timeout: Optional[float] = None) -> None:
         if self._thread is not None and self._thread.is_alive():
-            log.info("Waiting for in-flight checkpoint upload ...")
+            log.info("Waiting for background checkpoint upload to finish...")
             self._thread.join(timeout)
         self._thread = None
 
-    # -- listing / download ------------------------------------------------ #
     def list_checkpoints(self) -> List[int]:
         try:
             api = self._api()
             files = api.list_repo_files(repo_id=self.repo_id, repo_type="model")
         except Exception as exc:
-            log.warning("Could not list %s: %s", self.repo_id, exc)
+            log.warning("Could not list files in %s: %s", self.repo_id, exc)
             return []
 
         steps = set()
@@ -248,7 +228,7 @@ class HubCheckpointSync:
             )
             return json.loads(Path(path).read_text(encoding="utf-8"))
         except Exception as exc:
-            log.debug("No LATEST marker for run %s: %s", self.run_name, exc)
+            log.debug("No LATEST marker found for run %s: %s", self.run_name, exc)
             return None
 
     def latest_step(self) -> Optional[int]:
@@ -260,12 +240,13 @@ class HubCheckpointSync:
 
     def pull(self, step: Optional[int] = None, dest: Optional[str | Path] = None
              ) -> Optional[Path]:
+        """Downloads a remote checkpoint to a local destination directory."""
         from huggingface_hub import snapshot_download
 
         if step is None:
             step = self.latest_step()
         if step is None:
-            log.info("No remote checkpoint available for run '%s'.", self.run_name)
+            log.info("No remote checkpoint found for run '%s'.", self.run_name)
             return None
 
         dest_root = Path(dest) if dest else (artifacts_dir() / "hub_pull" / self.run_name)
@@ -280,15 +261,15 @@ class HubCheckpointSync:
             local_dir=str(dest_root),
         )
 
-        # snapshot_download preserves the repo layout underneath dest_root.
         resolved = dest_root / self.run_prefix / f"checkpoint-{step}"
         if not resolved.exists():
-            log.error("Expected %s after download but it is missing.", resolved)
+            log.error("Checkpoint expected at %s but not found.", resolved)
             return None
-        log.info("Checkpoint available at %s", resolved)
+        log.info("Checkpoint ready at %s", resolved)
         return resolved
 
     def prune(self, keep_last: int, protect_step: Optional[int] = None) -> None:
+        """Removes older remote checkpoints to maintain the target retention count."""
         if keep_last <= 0:
             return
         steps = self.list_checkpoints()
@@ -314,7 +295,7 @@ class HubCheckpointSync:
                 log.warning("Could not prune checkpoint-%d: %s", step, exc)
 
     def push_final(self, local_dir: str | Path, metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Upload the finished adapter to runs/<name>/final."""
+        """Uploads the completed adapter and run metadata to runs/<run_name>/final."""
         if not self.enabled:
             return
         self.ensure_repo()
@@ -336,24 +317,24 @@ class HubCheckpointSync:
                     repo_type="model",
                     commit_message=f"[{self.run_name}] run metadata",
                 )
-            log.info("Final adapter uploaded to %s/%s/final", self.repo_id, self.run_prefix)
+            log.info("Final adapter successfully uploaded to %s/%s/final", self.repo_id, self.run_prefix)
         except Exception as exc:
-            log.error("Final upload failed: %s", exc)
+            log.error("Failed to upload final adapter: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
-# Trainer integration
+# Trainer Callback Integration
 # --------------------------------------------------------------------------- #
 def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
                     fingerprint: str):
-    """Assemble the callback list. Imported lazily to keep transformers optional."""
+    """Assembles custom Hugging Face Trainer callbacks for logging and remote sync."""
     from transformers import TrainerCallback
     from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
     callbacks = []
 
     class HubCheckpointCallback(TrainerCallback):
-        """Uploads each local checkpoint to the Hub as soon as it is written."""
+        """Pushes checkpoint folders to the Hub upon Trainer save events."""
 
         def on_save(self, args, state, control, **kwargs):
             if sync is None or not sync.enabled or not state.is_world_process_zero:
@@ -377,7 +358,7 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
             return control
 
     class WallClockLimitCallback(TrainerCallback):
-        """Stops training cleanly before a Colab session is likely to be reclaimed."""
+        """Cleanly halts training and saves state before session timeout limits."""
 
         def __init__(self, minutes: float) -> None:
             self.limit_s = minutes * 60.0
@@ -391,8 +372,8 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
             if elapsed >= self.limit_s:
                 self.tripped = True
                 log.warning(
-                    "Wall-clock limit of %.0f min reached at step %d. "
-                    "Saving a checkpoint and stopping; resume with --resume hub.",
+                    "Runtime limit of %.0f min reached at step %d. "
+                    "Saving state and exiting; resume with --resume auto.",
                     self.limit_s / 60, state.global_step,
                 )
                 control.should_save = True
@@ -400,7 +381,7 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
             return control
 
     class JsonlLossLogger(TrainerCallback):
-        """Appends every log line to metrics.jsonl for later plotting."""
+        """Logs training metrics to metrics.jsonl for analysis."""
 
         def __init__(self, path: Path) -> None:
             self.path = path
@@ -418,7 +399,7 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
             return control
 
     class VramLogger(TrainerCallback):
-        """Records peak VRAM for hardware and memory profiling."""
+        """Records peak GPU memory allocation."""
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             try:
@@ -441,7 +422,7 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
 
 
 # --------------------------------------------------------------------------- #
-# Resume resolution
+# Checkpoint Resolution
 # --------------------------------------------------------------------------- #
 def find_local_checkpoint(output_dir: Path) -> Optional[Path]:
     if not output_dir.exists():
@@ -460,7 +441,7 @@ def find_local_checkpoint(output_dir: Path) -> Optional[Path]:
 
 def resolve_resume(cfg: RunConfig, mode: str,
                    sync: Optional[HubCheckpointSync]) -> Optional[Path]:
-    """Return a checkpoint directory to resume from, or None for a fresh start."""
+    """Resolves local or remote checkpoint directories for training resumption."""
     if mode == "none":
         return None
 
@@ -470,7 +451,7 @@ def resolve_resume(cfg: RunConfig, mode: str,
     if mode in {"auto", "local"}:
         local = find_local_checkpoint(output_dir)
         if local is not None:
-            log.info("Resuming from local checkpoint %s", local)
+            log.info("Resuming from local checkpoint: %s", local)
             return local
         if mode == "local":
             log.info("No local checkpoint found in %s; starting fresh.", output_dir)
@@ -478,31 +459,29 @@ def resolve_resume(cfg: RunConfig, mode: str,
 
     if mode in {"auto", "hub"}:
         if sync is None or not sync.enabled:
-            log.info("Hub sync disabled; starting fresh.")
+            log.info("Remote sync disabled; starting from scratch.")
             return None
         marker = sync.read_latest_marker()
         if marker:
             remote_fp = marker.get("config_fingerprint")
             if remote_fp and remote_fp != fingerprint:
                 log.warning(
-                    "Remote checkpoint fingerprint %s != current config fingerprint %s. "
-                    "The config has changed since that checkpoint was written. "
-                    "Refusing to resume -- rename the run or pass --resume none.",
+                    "Remote checkpoint config hash (%s) differs from current config (%s). "
+                    "Refusing to resume due to configuration drift. Use --resume none or change run_name.",
                     remote_fp, fingerprint,
                 )
                 raise SystemExit(2)
         pulled = sync.pull()
         if pulled is None:
-            log.info("No remote checkpoint for run '%s'; starting fresh.", cfg.run_name)
+            log.info("No remote checkpoint found for '%s'; starting fresh.", cfg.run_name)
             return None
 
-        # Copy into output_dir so Trainer's own bookkeeping stays consistent.
         step = int(_CHECKPOINT_RE.search(pulled.name).group(1))
         dest = output_dir / f"checkpoint-{step}"
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(pulled, dest)
-        log.info("Resuming from Hub checkpoint at step %d (%s)", step, dest)
+        log.info("Resuming from remote checkpoint at step %d (%s)", step, dest)
         return dest
 
     return None

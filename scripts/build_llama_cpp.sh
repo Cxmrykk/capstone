@@ -2,8 +2,8 @@
 #
 # Build llama.cpp for GGUF conversion and CPU inference.
 #
-#   Laptop (Debian 13):  bash scripts/build_llama_cpp.sh
-#   Colab (CUDA build):  BUILD_CUDA=1 bash scripts/build_llama_cpp.sh
+#   Local / Linux (CPU build): bash scripts/build_llama_cpp.sh
+#   Colab / GPU (CUDA build):  BUILD_CUDA=1 bash scripts/build_llama_cpp.sh
 #
 # Installs into vendor/llama.cpp inside the repo by default.
 set -euo pipefail

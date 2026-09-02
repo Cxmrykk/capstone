@@ -1,11 +1,7 @@
-"""llama.cpp backend for CPU inference on GGUF weights.
+"""llama.cpp generation backend for local and CPU inference on GGUF models.
 
-We drive `llama-server` over HTTP rather than binding llama-cpp-python:
-
-* no compilation step tied to a Python ABI,
-* the same binary you already built for interactive use,
-* prompts are sent pre-rendered, so formatting is byte-identical to the HF
-  backend and the two are directly comparable.
+Drives `llama-server` over local HTTP endpoints to ensure cross-platform compatibility
+without requiring C Python bindings, while maintaining identical prompt formatting.
 """
 from __future__ import annotations
 
@@ -29,7 +25,7 @@ _DEFAULT_PORT = 8757
 
 def find_llama_binary(name: str = "llama-server",
                       llama_cpp_dir: Optional[str] = None) -> Optional[str]:
-    """Locate a llama.cpp binary on PATH or in a known build directory."""
+    """Locates a compiled llama.cpp binary on PATH or within known build locations."""
     on_path = shutil.which(name)
     if on_path:
         return on_path
@@ -82,18 +78,16 @@ class LlamaCppBackend(GenerationBackend):
         self._tokenizer = None
         self._owns_server = False
 
-    # -- lifecycle --------------------------------------------------------- #
     def load(self) -> None:
         self._load_tokenizer()
         if self.server_url:
             if not self._wait_healthy(self.server_url, timeout=15.0):
-                raise RuntimeError(f"llama-server at {self.server_url} is not responding.")
-            log.info("Using existing llama-server at %s", self.server_url)
+                raise RuntimeError(f"llama-server at {self.server_url} is unreachable.")
+            log.info("Connected to existing llama-server at %s", self.server_url)
             return
         self._spawn_server()
 
     def _load_tokenizer(self) -> None:
-        """The HF tokenizer renders prompts; llama.cpp only sees the final string."""
         from src.training.model_loader import load_tokenizer
 
         cfg = self.cfg
@@ -109,17 +103,17 @@ class LlamaCppBackend(GenerationBackend):
 
     def _spawn_server(self) -> None:
         if not self.gguf_path:
-            raise ValueError("LlamaCppBackend needs either --gguf or --server-url.")
+            raise ValueError("LlamaCppBackend requires either --gguf or --server-url.")
         gguf = Path(self.gguf_path)
         if not gguf.exists():
-            raise FileNotFoundError(f"GGUF file not found: {gguf}")
+            raise FileNotFoundError(f"GGUF model file not found: {gguf}")
 
         binary = find_llama_binary("llama-server", self.llama_cpp_dir)
         if not binary:
             raise RuntimeError(
-                "llama-server not found. Build llama.cpp first:\n"
+                "llama-server executable not found. Build llama.cpp with:\n"
                 "  bash scripts/build_llama_cpp.sh\n"
-                "or set LLAMA_CPP_DIR to an existing checkout."
+                "or set LLAMA_CPP_DIR to an existing installation."
             )
 
         cmd = [
@@ -132,7 +126,7 @@ class LlamaCppBackend(GenerationBackend):
             "--parallel", "1",
             "--no-warmup",
         ]
-        log.info("Starting llama-server: %s", " ".join(cmd))
+        log.info("Starting llama-server process: %s", " ".join(cmd))
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -146,12 +140,11 @@ class LlamaCppBackend(GenerationBackend):
         if not self._wait_healthy(url, self.startup_timeout_s):
             self.close()
             raise RuntimeError(
-                f"llama-server failed to become healthy within {self.startup_timeout_s:.0f}s. "
-                "Run the command above manually to see its output -- the most likely cause "
-                "is that this llama.cpp build does not support the model architecture."
+                f"llama-server failed to initialize within {self.startup_timeout_s:.0f}s. "
+                "Verify that the model architecture is supported by the current llama.cpp build."
             )
         self.server_url = url
-        log.info("llama-server ready at %s (ctx=%d, threads=%d)",
+        log.info("llama-server ready at %s (context=%d, threads=%d)",
                  url, self.n_ctx, self.n_threads)
 
     @staticmethod
@@ -164,13 +157,11 @@ class LlamaCppBackend(GenerationBackend):
                 r = requests.get(f"{url}/health", timeout=5)
                 if r.status_code == 200:
                     return True
-                # 503 while the model is still loading is expected.
             except Exception:
                 pass
             time.sleep(1.5)
         return False
 
-    # -- generation -------------------------------------------------------- #
     def tokenizer(self):
         return self._tokenizer
 
@@ -222,7 +213,7 @@ class LlamaCppBackend(GenerationBackend):
                     text = data.get("content", "")
                     break
                 except Exception as exc:
-                    log.warning("llama-server request failed (attempt %d/3): %s",
+                    log.warning("llama-server request error (attempt %d/3): %s",
                                 attempt + 1, exc)
                     time.sleep(2 * (attempt + 1))
             outputs.append(text)
@@ -236,7 +227,7 @@ class LlamaCppBackend(GenerationBackend):
 
     def close(self) -> None:
         if self._proc is not None and self._owns_server:
-            log.info("Stopping llama-server (pid %s).", self._proc.pid)
+            log.info("Shutting down llama-server (PID %s).", self._proc.pid)
             try:
                 if hasattr(os, "killpg"):
                     os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)

@@ -1,4 +1,4 @@
-"""Generation backends: HF transformers (GPU) and llama.cpp (laptop)."""
+"""Generation backends: HF transformers (GPU) and llama.cpp (CPU/edge)."""
 
 from src.inference.base import GenerationBackend
 

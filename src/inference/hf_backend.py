@@ -1,4 +1,4 @@
-"""Transformers-based generation backend for GPU (e.g., Colab T4) or local CPU."""
+"""Transformers and PyTorch generation backend for GPU and CPU execution."""
 from __future__ import annotations
 
 import time
@@ -36,9 +36,9 @@ class TransformersBackend(GenerationBackend):
         self.model = model
         self._tokenizer = tokenizer
         self._meta = meta
-        # Left padding is mandatory for batched decoder-only generation.
+        # Left-padding is required for batched autoregressive decoder generation
         self._tokenizer.padding_side = "left"
-        log.info("HF backend ready (adapter=%s).", self.adapter or "none")
+        log.info("Transformers backend ready (adapter=%s).", self.adapter or "none")
 
     def tokenizer(self):
         return self._tokenizer
@@ -63,8 +63,7 @@ class TransformersBackend(GenerationBackend):
         tok = self._tokenizer
         device = next(self.model.parameters()).device
 
-        # Sort by length so each batch pads to a similar width, then restore
-        # the caller's ordering.
+        # Sort prompts by length to minimize padding overhead within batches
         order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
         outputs: List[str] = [""] * len(prompts)
 
@@ -106,7 +105,7 @@ class TransformersBackend(GenerationBackend):
                 rate = done / max(1e-6, time.time() - t0)
                 log.info("Generated %d/%d (%.2f items/s)", done, len(prompts), rate)
 
-        log.info("Generation complete: %d prompts in %.1fs.", len(prompts), time.time() - t0)
+        log.info("Batch generation complete: %d prompts in %.1fs.", len(prompts), time.time() - t0)
         return outputs
 
     def close(self) -> None:

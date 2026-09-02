@@ -1,12 +1,7 @@
-"""Translation-based metrics and query complexity classification.
+"""Evaluation metrics and graph query complexity categorization.
 
-Google-BLEU (GLEU) is implemented directly here rather than pulled from `evaluate`
-to avoid runtime network dependencies on Colab sessions and ensure offline
-evaluation capability.
-
-GLEU follows Wu et al. (2016): for n = 1..4, take the total n-gram overlap
-between hypothesis and reference, then take the minimum of
-overlap/|hypothesis n-grams| and overlap/|reference n-grams|.
+Implements standalone Google-BLEU (GLEU) calculation, string Exact Match (EM),
+normalized syntax matching, and graph traversal complexity analysis.
 """
 from __future__ import annotations
 
@@ -15,15 +10,15 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
-# Code-aware tokenisation: identifiers, numbers, string literals, punctuation.
+# Tokenizer recognizing Cypher identifiers, numbers, quoted literals, and graph syntax symbols
 _TOKEN_RE = re.compile(
     r"""
-    [A-Za-z_][A-Za-z_0-9]*      # identifiers / keywords
-  | \d+\.\d+                    # floats
-  | \d+                         # ints
-  | "(?:[^"\\]|\\.)*"           # double-quoted literals
-  | '(?:[^'\\]|\\.)*'           # single-quoted literals
-  | [^\sA-Za-z0-9_]             # punctuation, arrows, braces
+    [A-Za-z_][A-Za-z_0-9]*      # Identifiers and keywords
+  | \d+\.\d+                    # Floating-point numbers
+  | \d+                         # Integers
+  | "(?:[^"\\]|\\.)*"           # Double-quoted strings
+  | '(?:[^'\\]|\\.)*'           # Single-quoted strings
+  | [^\sA-Za-z0-9_]             # Graph patterns, braces, arrows
     """,
     re.VERBOSE,
 )
@@ -43,6 +38,7 @@ def _ngram_counts(tokens: Sequence[str], min_n: int = 1, max_n: int = 4) -> Coun
 
 def sentence_gleu(reference: str, hypothesis: str,
                   min_n: int = 1, max_n: int = 4) -> float:
+    """Computes sentence-level GLEU score based on n-gram precision and recall bounds."""
     ref_tokens = tokenize_cypher(reference)
     hyp_tokens = tokenize_cypher(hypothesis)
     if not ref_tokens or not hyp_tokens:
@@ -61,7 +57,7 @@ def sentence_gleu(reference: str, hypothesis: str,
 
 def corpus_gleu(references: Sequence[str], hypotheses: Sequence[str],
                 min_n: int = 1, max_n: int = 4) -> float:
-    """Corpus-level GLEU: aggregate counts first, then take the min of the ratios."""
+    """Computes corpus-level GLEU score over all examples."""
     total_overlap = total_hyp = total_ref = 0
     for ref, hyp in zip(references, hypotheses):
         ref_tokens = tokenize_cypher(ref)
@@ -77,7 +73,7 @@ def corpus_gleu(references: Sequence[str], hypotheses: Sequence[str],
 
 
 # --------------------------------------------------------------------------- #
-# Exact match
+# Exact Match Metrics
 # --------------------------------------------------------------------------- #
 _WS = re.compile(r"\s+")
 _CYPHER_KEYWORDS = {
@@ -91,7 +87,7 @@ _CYPHER_KEYWORDS = {
 
 
 def normalise_cypher(text: str) -> str:
-    """Whitespace-insensitive, keyword-case-insensitive normalisation."""
+    """Normalizes query text by standardizing whitespace and uppercase keyword casing."""
     if not text:
         return ""
     tokens = tokenize_cypher(text)
@@ -116,7 +112,7 @@ def normalised_exact_match(reference: str, hypothesis: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Query complexity (Lyu et al. 2026, section 4.5)
+# Query Complexity Classification
 # --------------------------------------------------------------------------- #
 _AGG_RE = re.compile(r"\b(count|sum|avg|min|max|collect|percentile\w*|stdev\w*)\s*\(",
                      re.IGNORECASE)
@@ -137,8 +133,14 @@ class Complexity:
 
 
 def classify_complexity(cypher: str) -> Complexity:
-    """Heuristic difficulty label to segment results across complexity tiers
-    (easy / medium / hard / extra_hard)."""
+    """Classifies Cypher queries into difficulty tiers based on topological structure.
+
+    Tiers:
+      - easy: single-node or single-hop patterns without aggregation
+      - medium: one-hop queries with basic filtering, simple WITH or aggregate clauses
+      - hard: multi-hop queries, multiple MATCH clauses, or combined aggregations
+      - extra_hard: variable-length traversals, >=4 hops, or nested multi-stage queries
+    """
     text = cypher or ""
     hops = len(_REL_RE.findall(text))
     matches = len(_MATCH_RE.findall(text))
@@ -162,10 +164,10 @@ COMPLEXITY_ORDER = ["easy", "medium", "hard", "extra_hard"]
 
 
 # --------------------------------------------------------------------------- #
-# Aggregation
+# Summarization & Aggregation
 # --------------------------------------------------------------------------- #
 def summarise(rows: List[Dict], key_prefix: str = "") -> Dict[str, float]:
-    """Aggregate per-row metric dicts into corpus-level numbers."""
+    """Aggregates metric rows into a summary dictionary."""
     if not rows:
         return {}
 
@@ -210,7 +212,7 @@ def summarise(rows: List[Dict], key_prefix: str = "") -> Dict[str, float]:
 
 
 def score_row(row: Dict) -> Dict:
-    """Attach translation metrics and a complexity label to a prediction row."""
+    """Computes metrics and complexity tier for an individual prediction row."""
     gold = row.get("gold_cypher") or ""
     pred = row.get("predicted_cypher") or ""
     row["gleu"] = round(sentence_gleu(gold, pred), 4)

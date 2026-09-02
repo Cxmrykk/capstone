@@ -1,27 +1,27 @@
-# AI Agent Instructions: Capstone Progress Logger
+# Development & Experiment Logger Instructions
 
-To ensure we have a paper trail for the final thesis, you must automatically log our interactions in the `history/` directory.
+To maintain an audit trail for experiment reproducibility and development tracking, log major updates in the `history/` directory.
 
 ## When to Log
 
-Create a new log file whenever:
+Create a new entry whenever:
 
-1. We complete a coding task or feature.
-2. We fix a bug.
-3. I paste terminal outputs, training metrics, or error logs back to you.
+1. A module, pipeline stage, or feature implementation is updated.
+2. A bug, runtime issue, or environment constraint is resolved.
+3. Model evaluation results, training loss curves, or benchmark metrics are collected.
 
 ## File Naming
 
-- Check the `history/` directory.
-- Find the highest numbered file (e.g., `004.md`).
+- Inspect the `history/` directory.
+- Identify the highest numbered file (e.g., `004.md`).
 - Create the next sequential file (e.g., `005.md`).
 
-## What to Include in the Log
+## Log Structure
 
-Do not use a rigid, corporate template. Just write a clean, informal Markdown file containing:
+Write a structured Markdown record containing:
 
-1. **Context:** A quick one-liner about what we were trying to achieve.
-2. **Changes & Reasons:** A bulleted list summarizing the files you changed, what you did, and crucially, _why_ you did it.
-3. **User Logs:** A code block containing the exact terminal output, error tracebacks, or training metrics (Loss, Exact Match scores, VRAM usage) that I pasted to you.
+1. **Context:** A summary of the objective, bug fix, or experiment configuration.
+2. **Modifications:** A bulleted list of modified files, code changes, and engineering rationale.
+3. **Logs & Metrics:** Terminal output, training telemetry (loss, step count, VRAM usage), or evaluation metrics (GLEU, Exact Match, Execution Accuracy).
 
-When putting the log inside a markdown code block, make sure to use four backticks: \`\`\`\`markdown.
+When formatting logs within Markdown code blocks, use four backticks: \`\`\`\`markdown.

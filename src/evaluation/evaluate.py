@@ -1,4 +1,4 @@
-"""Scoring orchestration: translation metrics, syntax validation, execution accuracy."""
+"""Scoring orchestration for translation metrics, syntax validation, and execution accuracy."""
 from __future__ import annotations
 
 import json
@@ -36,6 +36,7 @@ def evaluate_file(
     limit: Optional[int] = None,
     use_cache: bool = True,
 ) -> Dict[str, Any]:
+    """Scores a single JSONL predictions file across text and execution metrics."""
     rows = read_jsonl(pred_path)
     if limit:
         rows = rows[:limit]
@@ -78,10 +79,10 @@ def evaluate_file(
                 ))
 
             if (i + 1) % 50 == 0:
-                log.info("  executed %d/%d (%.1fs elapsed)", i + 1, len(rows), time.time() - t0)
+                log.info("  Executed %d/%d (%.1fs elapsed)", i + 1, len(rows), time.time() - t0)
 
         executor.close()
-        log.info("Execution phase done in %.1fs (skipped: %d without a database, %d filtered out).",
+        log.info("Execution phase completed in %.1fs (skipped: %d without database, %d filtered).",
                  time.time() - t0, skipped_no_db, skipped_filtered)
 
     report: Dict[str, Any] = {
@@ -91,6 +92,7 @@ def evaluate_file(
         "overall": summarise(rows),
     }
 
+    # Breakdown by topological complexity
     by_complexity: Dict[str, Dict[str, float]] = {}
     grouped: Dict[str, List[Dict]] = defaultdict(list)
     for row in rows:
@@ -100,6 +102,7 @@ def evaluate_file(
             by_complexity[label] = summarise(grouped[label])
     report["by_complexity"] = by_complexity
 
+    # Breakdown by dataset source
     by_source: Dict[str, Dict[str, float]] = {}
     grouped_src: Dict[str, List[Dict]] = defaultdict(list)
     for row in rows:
@@ -116,15 +119,15 @@ def evaluate_file(
 
 
 def render_markdown(reports: List[Dict[str, Any]]) -> str:
-    lines: List[str] = ["# Text2Cypher evaluation report", ""]
+    """Renders formatted markdown summaries for evaluation reports."""
+    lines: List[str] = ["# Text2Cypher Evaluation Report", ""]
     lines.append(f"_Generated {time.strftime('%Y-%m-%d %H:%M:%S')}_")
     lines.append("")
 
-    # ---- headline comparison table ---------------------------------------- #
-    lines.append("## Overall")
+    lines.append("## Overall Metrics")
     lines.append("")
-    header = ("| Run | Model | Schema | Backend | N | GLEU | Exact Match | "
-              "Norm. EM | Executable | Exec. Acc. | Prompt tok (mean) |")
+    header = ("| Run | Model | Schema Mode | Backend | N | GLEU | Exact Match | "
+              "Norm. EM | Executable | Exec. Acc. | Prompt Tok (Mean) |")
     lines.append(header)
     lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for rep in reports:
@@ -148,24 +151,23 @@ def render_markdown(reports: List[Dict[str, Any]]) -> str:
         )
     lines.append("")
 
-    # ---- per-report detail ------------------------------------------------ #
     for rep in reports:
         m = rep.get("meta", {})
         name = m.get("tag") or Path(rep["predictions_file"]).stem
         lines.append(f"## {name}")
         lines.append("")
-        lines.append(f"- Predictions: `{rep['predictions_file']}`")
+        lines.append(f"- Predictions File: `{rep['predictions_file']}`")
         if m:
             lines.append(f"- Model: `{m.get('model_key')}` "
                          f"(adapter: `{m.get('adapter') or 'none'}`)")
             lines.append(f"- Backend: `{m.get('backend')}`, "
-                         f"schema mode: `{m.get('schema_mode')}`")
+                         f"Schema Mode: `{m.get('schema_mode')}`")
             if m.get("seconds_per_item"):
                 lines.append(f"- Latency: {m['seconds_per_item']} s/item on "
                              f"`{m.get('host', 'unknown host')}`")
         lines.append("")
 
-        lines.append("### By query complexity")
+        lines.append("### By Query Complexity")
         lines.append("")
         lines.append("| Complexity | N | GLEU | Exact Match | Executable | Exec. Acc. |")
         lines.append("|---|---|---|---|---|---|")
@@ -183,7 +185,7 @@ def render_markdown(reports: List[Dict[str, Any]]) -> str:
         lines.append("")
 
         if rep.get("by_data_source"):
-            lines.append("### By data source")
+            lines.append("### By Data Source")
             lines.append("")
             lines.append("| Source | N | GLEU | Exact Match | Exec. Acc. |")
             lines.append("|---|---|---|---|---|")
@@ -198,15 +200,10 @@ def render_markdown(reports: List[Dict[str, Any]]) -> str:
 
     lines.append("---")
     lines.append("")
-    lines.append("**Metric definitions.** Google-BLEU is corpus-level GLEU over "
-                 "code-aware tokens. Exact Match is a strict string comparison; "
-                 "Normalised Exact Match ignores whitespace and keyword casing. "
-                 "Executable is the share of predicted queries that run without "
-                 "error. Execution Accuracy compares the returned result sets, "
-                 "sorted lexicographically unless the gold query contains "
-                 "ORDER BY. Complexity labels follow the heuristic in "
-                 "`src/evaluation/metrics.py`, based on hop count, MATCH and WITH "
-                 "clauses, aggregations and variable-length paths.")
+    lines.append("**Definitions:** Google-BLEU (GLEU) measures code-aware n-gram overlap. "
+                 "Exact Match validates exact query string equality; Normalised Exact Match "
+                 "ignores whitespace and keyword casing. Executable indicates queries running without "
+                 "syntax errors. Execution Accuracy validates result set equivalence with the reference query.")
     return "\n".join(lines)
 
 
@@ -228,7 +225,7 @@ def evaluate_files(
     for raw_path in prediction_files:
         path = Path(raw_path)
         if not path.exists():
-            log.error("Predictions file not found: %s", path)
+            log.error("Prediction file not found: %s", path)
             continue
         reports.append(evaluate_file(
             path, cfg,
@@ -240,7 +237,7 @@ def evaluate_files(
         ))
 
     if not reports:
-        raise SystemExit("No predictions files could be scored.")
+        raise SystemExit("No prediction files could be evaluated.")
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = Path(out_path) if out_path else reports_dir() / f"evaluation-{stamp}.md"
@@ -255,5 +252,5 @@ def evaluate_files(
     print()
     print(markdown)
     print()
-    log.info("Report written to %s (and %s)", out, json_out)
+    log.info("Evaluation report saved to %s (and %s)", out, json_out)
     return out

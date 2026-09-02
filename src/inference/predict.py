@@ -1,4 +1,8 @@
-"""Run a backend over an evaluation split and write a predictions file."""
+"""Evaluation inference pipeline.
+
+Runs inference across dataset partitions using either Transformers or GGUF backends,
+extracts Cypher statements, records latency metrics, and writes JSONL outputs.
+"""
 from __future__ import annotations
 
 import json
@@ -37,10 +41,11 @@ def run_prediction(
     out_path: Optional[str] = None,
     tag: Optional[str] = None,
 ) -> Path:
+    """Runs generation across an evaluation split and outputs predictions with metadata."""
     records = load_raw_split(split, cfg.data.dataset_dir)
     limit = limit if limit is not None else cfg.data.max_eval_samples
     records = subsample(records, limit, cfg.data.seed)
-    log.info("Predicting over %d instances from split '%s'.", len(records), split)
+    log.info("Running prediction on %d examples from split '%s'.", len(records), split)
 
     if backend_name == "hf":
         backend = get_backend("hf", cfg=cfg, adapter=adapter, model_path=model_path)
@@ -56,7 +61,7 @@ def run_prediction(
     backend.load()
     tokenizer = backend.tokenizer()
     if tokenizer is None:
-        raise RuntimeError("Backend did not expose a tokenizer; cannot render prompts.")
+        raise RuntimeError("Backend did not provide a tokenizer; cannot construct prompts.")
 
     supports_system = cfg.model.spec.supports_system_role
     if supports_system is None:
@@ -145,8 +150,8 @@ def run_prediction(
     meta_path = out.with_suffix(".meta.json")
     meta_path.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
 
-    log.info("Wrote %d predictions to %s (%.1fs, %.3f s/item).",
+    log.info("Saved %d predictions to %s (%.1fs, %.3f s/item).",
              len(rows), out, elapsed, meta["seconds_per_item"])
-    log.info("Mean prompt tokens: %s (schema_mode=%s)",
+    log.info("Average prompt token count: %s (schema_mode=%s)",
              meta["mean_prompt_tokens"], cfg.data.schema_mode)
     return out

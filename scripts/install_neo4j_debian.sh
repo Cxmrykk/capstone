@@ -38,7 +38,7 @@ $SUDO apt-get update
 $SUDO apt-get install -y neo4j
 
 CONF=/etc/neo4j/neo4j.conf
-say "Tuning ${CONF} for a laptop (X1 Carbon-class, 16 GB RAM)"
+say "Tuning ${CONF} for standard workstations (e.g. 16 GB RAM baseline)"
 $SUDO cp "${CONF}" "${CONF}.bak.$(date +%s)"
 
 set_conf() {
@@ -50,7 +50,7 @@ set_conf() {
     fi
 }
 
-# Conservative heap/page-cache so Neo4j does not fight the browser for RAM.
+# Conservative heap/page-cache so Neo4j does not fight the host applications for RAM.
 set_conf "server.memory.heap.initial_size" "1G"
 set_conf "server.memory.heap.max_size" "2G"
 set_conf "server.memory.pagecache.size" "1G"

@@ -1,16 +1,9 @@
-"""Neo4j connectivity, query execution and result comparison.
+"""Neo4j driver connectivity, query execution, and result verification.
 
-Two providers:
-
-* ``demo``  -- Neo4j Labs' public read-only demo server. The dataset's
-  ``database_reference_alias`` values (``neo4jlabs_demo_db_fincen``) map onto it
-  directly: host demo.neo4jlabs.com, and user == password == database name.
-  This is the same target Ozsoy et al. used, so numbers stay comparable.
-
-* ``local`` -- a bare-metal Neo4j installed from the Debian package
-  (scripts/install_neo4j_debian.sh). Note that Community Edition serves exactly
-  one database, so a local run can only evaluate the alias whose dump is
-  currently loaded; set neo4j.local_alias and use --only-db.
+Supported connection providers:
+  * "demo"  -- Neo4j Labs public demo server. Resolves database aliases
+               (e.g., neo4jlabs_demo_db_fincen) using demo endpoint conventions.
+  * "local" -- Local Neo4j instance for offline development and testing.
 """
 from __future__ import annotations
 
@@ -59,22 +52,21 @@ def alias_to_database(alias: str) -> Optional[str]:
 
 
 def resolve_target(alias: Optional[str], cfg: Neo4jConfig) -> Optional[Neo4jTarget]:
+    """Resolves database alias to connection credentials based on the active provider."""
     db = alias_to_database(alias) if alias else None
     if not db:
         return None
 
     if cfg.provider == "demo":
         uri = os.environ.get("NEO4J_DEMO_URI", cfg.demo_uri)
-        # Neo4j Labs convention: credentials equal the database name.
         return Neo4jTarget(uri=uri, user=db, password=db, database=db, alias=alias or db)
 
     if cfg.provider == "local":
         if cfg.local_alias and alias_to_database(cfg.local_alias) != db:
-            # Community Edition cannot host this database.
             return None
         password = os.environ.get(cfg.local_password_env, "")
         if not password:
-            log.warning("Environment variable %s is not set; local Neo4j auth will fail.",
+            log.warning("Environment variable %s is not set; local Neo4j authentication may fail.",
                         cfg.local_password_env)
         return Neo4jTarget(
             uri=os.environ.get("NEO4J_URI", cfg.local_uri),
@@ -88,14 +80,13 @@ def resolve_target(alias: Optional[str], cfg: Neo4jConfig) -> Optional[Neo4jTarg
 
 
 # --------------------------------------------------------------------------- #
-# Result normalisation
+# Result Normalization
 # --------------------------------------------------------------------------- #
 def _normalise_value(value: Any, ndigits: int) -> Any:
-    """Reduce a Neo4j value to a comparable JSON-safe primitive."""
+    """Reduces Neo4j driver types to standard JSON-compatible primitives."""
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
-        # Guard against float noise in aggregates.
         return round(value, ndigits)
     if isinstance(value, (list, tuple)):
         return [_normalise_value(v, ndigits) for v in value]
@@ -104,7 +95,6 @@ def _normalise_value(value: Any, ndigits: int) -> Any:
     if isinstance(value, (bytes, bytearray)):
         return value.hex()
 
-    # Graph and temporal types from the neo4j driver.
     try:
         from neo4j.graph import Node, Path, Relationship
 
@@ -131,7 +121,7 @@ def _normalise_value(value: Any, ndigits: int) -> Any:
 
 def normalise_records(records: Sequence[Any], ndigits: int = 6
                       ) -> Tuple[List[str], List[List[Any]]]:
-    """Convert driver records into (column names, list of value rows)."""
+    """Extracts column headers and normalized value rows from Neo4j driver results."""
     keys: List[str] = []
     rows: List[List[Any]] = []
     for rec in records:
@@ -147,11 +137,7 @@ def normalise_records(records: Sequence[Any], ndigits: int = 6
 
 def result_signature(keys: Sequence[str], rows: Sequence[Sequence[Any]],
                      order_sensitive: bool, compare_keys: bool) -> str:
-    """Canonical string for comparing two result sets.
-
-    Rows are sorted lexicographically unless the gold query specifies an
-    explicit ordering, in which case row order carries meaning and is preserved.
-    """
+    """Builds a canonical signature string for deterministic result set comparison."""
     serialised = [json.dumps(row, sort_keys=True, default=str) for row in rows]
     if not order_sensitive:
         serialised = sorted(serialised)
@@ -166,7 +152,7 @@ def query_is_ordered(cypher: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Executor
+# Executor & Cache
 # --------------------------------------------------------------------------- #
 @dataclass
 class ExecutionResult:
@@ -184,7 +170,7 @@ class ExecutionResult:
 
 
 class Neo4jExecutor:
-    """Driver pool + on-disk result cache + politeness throttle."""
+    """Manages driver connection pools, query throttling, and execution result caching."""
 
     def __init__(self, cfg: Neo4jConfig, use_cache: bool = True) -> None:
         self.cfg = cfg
@@ -197,7 +183,6 @@ class Neo4jExecutor:
             self._cache_root.mkdir(parents=True, exist_ok=True)
         self._unreachable: Dict[str, str] = {}
 
-    # -- driver management -------------------------------------------------- #
     def _driver(self, target: Neo4jTarget):
         with self._lock:
             key = target.key()
@@ -207,8 +192,8 @@ class Neo4jExecutor:
                 from neo4j import GraphDatabase
             except ImportError as exc:
                 raise ImportError(
-                    "The neo4j driver is required for execution-based evaluation.\n"
-                    "  pip install neo4j"
+                    "The neo4j driver is required for query execution.\n"
+                    "Install with: pip install neo4j"
                 ) from exc
 
             driver = GraphDatabase.driver(
@@ -239,7 +224,6 @@ class Neo4jExecutor:
                     pass
             self._drivers.clear()
 
-    # -- caching ------------------------------------------------------------ #
     def _cache_path(self, target: Neo4jTarget, query: str, kind: str) -> Path:
         digest = hashlib.sha256(f"{target.key()}|{kind}|{query}".encode("utf-8")).hexdigest()
         sub = self._cache_root / target.database / digest[:2]
@@ -270,9 +254,8 @@ class Neo4jExecutor:
             time.sleep(self.cfg.min_interval_s - delta)
         self._last_call = time.time()
 
-    # -- execution ---------------------------------------------------------- #
     def validate_syntax(self, target: Neo4jTarget, query: str) -> Tuple[bool, Optional[str]]:
-        """EXPLAIN the query: catches syntax and schema errors without running it."""
+        """Validates query syntax and schema alignment using EXPLAIN without full execution."""
         if not (query or "").strip():
             return False, "empty query"
 
@@ -294,6 +277,7 @@ class Neo4jExecutor:
             return False, msg
 
     def execute(self, target: Neo4jTarget, query: str) -> ExecutionResult:
+        """Executes a Cypher query against the target database."""
         if not (query or "").strip():
             return ExecutionResult(ok=False, keys=[], rows=[], error="empty query")
 
@@ -333,12 +317,11 @@ class Neo4jExecutor:
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 lowered = last_error.lower()
-                # Auth/DNS problems will not fix themselves; stop hammering.
                 if any(tok in lowered for tok in
                        ("authentication", "unauthorized", "servicunavailable",
                         "cannot resolve", "unable to retrieve routing")):
                     if attempt == 0:
-                        log.error("Cannot reach %s (%s): %s",
+                        log.error("Unable to connect to %s (%s): %s",
                                   target.database, target.uri, last_error)
                     self._unreachable[target.key()] = last_error
                     break
@@ -346,14 +329,13 @@ class Neo4jExecutor:
                     time.sleep(1.0 + attempt)
 
         payload = {"ok": False, "keys": [], "rows": [], "error": last_error, "elapsed_s": 0.0}
-        # A syntax/semantic error is a genuine, cacheable property of the query.
         if "unreachable" not in last_error.lower():
             self._write_cache(cache_file, payload)
         return ExecutionResult(False, [], [], last_error)
 
     def compare(self, target: Neo4jTarget, gold_cypher: str,
                 pred_cypher: str) -> Dict[str, Any]:
-        """Execute both queries and decide whether the results match."""
+        """Executes reference and predicted queries and compares resulting records."""
         order_sensitive = self.cfg.order_sensitive and query_is_ordered(gold_cypher)
 
         gold = self.execute(target, gold_cypher)

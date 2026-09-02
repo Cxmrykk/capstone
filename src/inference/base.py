@@ -1,8 +1,7 @@
-"""Backend interface.
+"""Abstract base interface for generation backends.
 
-Both backends receive fully-rendered prompt strings produced by
-`src.data.prompts.render_prompt`. Prompt construction therefore lives in
-exactly one place, so a Colab result and a laptop GGUF result are comparable.
+Provides a unified interface for prompt-based generation across GPU Transformers
+and GGUF/llama.cpp inference engines, ensuring identical prompt formatting.
 """
 from __future__ import annotations
 
@@ -15,15 +14,17 @@ class GenerationBackend(ABC):
 
     @abstractmethod
     def load(self) -> None:
+        """Loads and initializes model weights and resources."""
         ...
 
     @abstractmethod
     def generate(self, prompts: List[str], max_new_tokens: int = 256,
                  temperature: float = 0.0, **kwargs) -> List[str]:
+        """Generates completions for a batch of pre-formatted prompt strings."""
         ...
 
     def tokenizer(self):
-        """The tokenizer used for prompt rendering (may be None)."""
+        """Returns the associated tokenizer used for prompt formatting."""
         return None
 
     def info(self) -> Dict[str, Any]:

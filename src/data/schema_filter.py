@@ -1,22 +1,21 @@
-"""Schema representation and filtering (Ozsoy 2025, section 3).
+"""Graph schema representation, parsing, and context filtering.
 
-Two schema string dialects appear in text2cypher-2024v1:
-
-  A) markdown-ish
+Supports two common graph schema serialization formats:
+  A) Structured Markdown:
        Node properties:
        - **Country**
          - `code`: STRING Example: "AFG"
        The relationships:
        (:Filing)-[:BENEFITS]->(:Entity)
 
-  B) inline
+  B) Inline Definitions:
        Node properties are the following:
        Movie {title: STRING, released: INTEGER}, Person {name: STRING}
        The relationships are the following:
        (:Person)-[:ACTED_IN]->(:Movie)
 
-The parser handles both and degrades gracefully: if parsing fails we return
-the schema untouched rather than feeding the model a mangled context.
+Provides heuristic exact-match, NER-masked, and embedding similarity pruning
+to retain relevant schema components within constrained token budgets.
 """
 from __future__ import annotations
 
@@ -28,8 +27,7 @@ from src.logging_utils import get_logger
 
 log = get_logger(__name__)
 
-# ``Example: "AFG"`` / ``Min: 1, Max: 174`` suffixes -- the difference between
-# Ozsoy's "Enhanced" and "Base" static schemas.
+# Pattern to identify and remove descriptive property annotations (e.g. value ranges or examples)
 _EXAMPLE_SUFFIX = re.compile(r"\s*(Example:.*|Min:.*?Max:.*?)$", re.IGNORECASE)
 
 _PATTERN_RE = re.compile(r"\(:?([A-Za-z_][\w]*)?\)\s*-\s*\[:([A-Za-z_][\w]*)\]\s*->\s*\(:?([A-Za-z_][\w]*)?\)")
@@ -44,6 +42,7 @@ _SECTION_PATTERNS = re.compile(r"^\s*the relationships", re.IGNORECASE)
 
 @dataclass
 class GraphSchema:
+    """Internal graph schema representation containing nodes, properties, and relationship triplets."""
     nodes: Dict[str, Dict[str, str]] = field(default_factory=dict)
     rel_props: Dict[str, Dict[str, str]] = field(default_factory=dict)
     patterns: List[Tuple[str, str, str]] = field(default_factory=list)
@@ -54,7 +53,7 @@ class GraphSchema:
         return not self.nodes and not self.rel_props and not self.patterns
 
     def render(self, include_examples: bool = True) -> str:
-        """Serialise back to the canonical markdown-ish dialect."""
+        """Serializes the schema representation back into structured markdown."""
         if not self.parsed:
             return self.raw
 
@@ -91,6 +90,7 @@ class GraphSchema:
 # Parsing
 # --------------------------------------------------------------------------- #
 def parse_schema(raw: str) -> GraphSchema:
+    """Parses raw schema strings into a GraphSchema structure."""
     schema = GraphSchema(raw=raw or "")
     if not raw or not raw.strip():
         return schema
@@ -120,7 +120,6 @@ def parse_schema(raw: str) -> GraphSchema:
                 found_structure = True
             continue
 
-        # Relationship patterns can appear anywhere.
         pattern_hits = list(_PATTERN_RE.finditer(stripped))
         if pattern_hits:
             for m in pattern_hits:
@@ -147,7 +146,7 @@ def parse_schema(raw: str) -> GraphSchema:
             found_structure = True
             continue
 
-        # Dialect B: "Movie {title: STRING}, Person {name: STRING}"
+        # Format B: "Movie {title: STRING}, Person {name: STRING}"
         if section in {"node", "rel"} and "{" in stripped:
             _absorb_inline(stripped, schema, section)
             found_structure = True
@@ -155,7 +154,7 @@ def parse_schema(raw: str) -> GraphSchema:
 
     schema.parsed = found_structure
     if not found_structure:
-        log.debug("Schema parsing found no structure; will pass through unchanged.")
+        log.debug("Schema parser detected no structured fields; passing raw schema through.")
     return schema
 
 
@@ -175,12 +174,11 @@ def _absorb_inline(line: str, schema: GraphSchema, kind: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Tokenisation helpers
+# Tokenization & Matching Helpers
 # --------------------------------------------------------------------------- #
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
-# Deliberately small: only words that would cause spurious schema matches.
 _STOPWORDS = {
     "the", "a", "an", "of", "in", "on", "for", "to", "and", "or", "with", "by",
     "what", "which", "who", "whom", "how", "many", "much", "list", "show", "give",
@@ -191,7 +189,7 @@ _STOPWORDS = {
 
 
 def _explode(term: str) -> Set[str]:
-    """Turn `originator_bank_country` / `ACTED_IN` into searchable word pieces."""
+    """Splits compound identifiers (camelCase, snake_case) into searchable word tokens."""
     pieces: Set[str] = set()
     term = term.strip()
     if not term:
@@ -208,13 +206,14 @@ def _explode(term: str) -> Set[str]:
 
 
 def question_tokens(question: str) -> Set[str]:
+    """Extracts searchable keyword tokens from the natural language question."""
     toks: Set[str] = set()
     for word in _WORD_RE.findall(question or ""):
         low = word.lower()
         if low in _STOPWORDS:
             continue
         toks |= _explode(word)
-        # Crude singularisation so "movies" matches the `Movie` label.
+        # Handle simple English pluralization to match singular schema labels
         if low.endswith("ies") and len(low) > 4:
             toks.add(low[:-3] + "y")
         elif low.endswith("ses") and len(low) > 4:
@@ -230,11 +229,7 @@ _NUMBER = re.compile(r"\b\d[\d,.]*\b")
 
 
 def ner_mask(question: str) -> str:
-    """Heuristic stand-in for NER masking (Ozsoy 2025, section 3.2).
-
-    Prevents literal entity values ("Tom Hanks", "United Kingdom") from matching
-    schema labels during exact-match pruning.
-    """
+    """Masks named entities and literals to prevent false matches against schema elements."""
     if not question:
         return ""
     masked = _QUOTED.sub(" ENTITY ", question)
@@ -242,7 +237,6 @@ def ner_mask(question: str) -> str:
 
     def _sub(m: re.Match) -> str:
         span = m.group(0)
-        # Do not mask the very first word of the sentence.
         if m.start() == 0:
             return span
         return " ENTITY " if " " in span or len(span) > 3 else span
@@ -251,7 +245,7 @@ def ner_mask(question: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Filters
+# Filtering Algorithms
 # --------------------------------------------------------------------------- #
 def filter_exact_match(
     schema: GraphSchema,
@@ -259,6 +253,7 @@ def filter_exact_match(
     min_nodes: int = 1,
     keep_patterns_for_kept_nodes: bool = True,
 ) -> GraphSchema:
+    """Filters schema elements by matching lexical tokens in the question."""
     if not schema.parsed:
         return schema
 
@@ -271,7 +266,6 @@ def filter_exact_match(
         label_hit = bool(_explode(label) & tokens)
         matched_props = {n: d for n, d in props.items() if _explode(n) & tokens}
         if label_hit:
-            # Label matched: keep the full property list for that node.
             kept_nodes[label] = dict(props)
         elif matched_props:
             kept_nodes[label] = matched_props
@@ -292,15 +286,13 @@ def filter_exact_match(
         if rel_hit or (keep_patterns_for_kept_nodes and endpoints_kept):
             kept_patterns.append((src, rel, dst))
 
-    # Re-attach any node referenced by a surviving pattern; a pattern with an
-    # undefined endpoint is worse than no pruning at all.
+    # Reconnect endpoints required by retained relationship patterns
     for src, _rel, dst in kept_patterns:
         for endpoint in (src, dst):
             if endpoint and endpoint not in kept_nodes and endpoint in schema.nodes:
                 kept_nodes[endpoint] = schema.nodes[endpoint]
 
     if len(kept_nodes) < min_nodes and not kept_patterns:
-        # Over-pruned: an empty schema guarantees a wrong query, so fall back.
         return schema
 
     return GraphSchema(
@@ -319,7 +311,7 @@ def filter_by_similarity(
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     _cache: Dict[str, object] = {},
 ) -> GraphSchema:
-    """Embedding-based pruning. Optional dependency; degrades to exact match."""
+    """Prunes schema elements using embedding similarity against the user query."""
     if not schema.parsed:
         return schema
     try:
@@ -394,7 +386,7 @@ def apply_schema_mode(
     similarity_threshold: float = 0.45,
     similarity_model: str = "sentence-transformers/all-MiniLM-L6-v2",
 ) -> str:
-    """Single entry point used by the dataset builder and the predictor."""
+    """Transforms raw schema text according to the selected schema representation mode."""
     if mode == "none":
         return ""
     if mode == "enhanced":
@@ -402,7 +394,6 @@ def apply_schema_mode(
 
     schema = parse_schema(raw_schema)
     if not schema.parsed:
-        # Unparseable dialect: better to keep the original than to guess.
         return raw_schema or ""
 
     if mode == "base":
@@ -427,10 +418,10 @@ def apply_schema_mode(
 
 
 def trim_schema_text(schema_text: str, drop_chars: int) -> str:
-    """Drop trailing property lines to fit a token budget.
+    """Trims trailing property lines to respect sequence length budgets.
 
-    Removes leaf property lines first and never removes the relationship
-    pattern block, which carries most of the structural signal.
+    Protects relationship topology definitions from being truncated, as graph
+    patterns carry the primary structural signal needed for query generation.
     """
     if drop_chars <= 0 or not schema_text:
         return schema_text
