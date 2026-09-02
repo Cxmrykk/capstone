@@ -2,9 +2,9 @@
 
 Design notes:
 
-* Unsloth is tried first (as promised in the proposal) but is not required. New
-  architectures frequently lag Unsloth support, and a failed import must not
-  cost a Colab session.
+* Unsloth is tried first for acceleration but is not required. New architectures
+  frequently lag Unsloth support, and a fallback to Transformers+PEFT ensures
+  resilience on Colab sessions.
 * dtype is chosen from the device, never hardcoded. A T4 reports
   bf16_supported == False and we fall back to fp16 automatically.
 * LoRA target modules are discovered by walking the module tree rather than

@@ -1,11 +1,10 @@
 """GGUF conversion and quantisation via llama.cpp.
 
-Honest caveat, and worth stating in the thesis: llama.cpp must already support
-the model architecture. Gemma 4's per-layer embeddings and Qwen3.5's
-linear-attention blocks are both recent; if `convert_hf_to_gguf.py` does not
-recognise the architecture, this step fails and no amount of retrying helps.
-Fallbacks in that case are (a) update the llama.cpp checkout, (b) run the
-merged fp16 weights through transformers on CPU for laptop testing.
+Note: llama.cpp must already support the target model architecture. For recent
+architectures (such as per-layer embeddings or hybrid linear attention), if
+convert_hf_to_gguf.py does not recognize the architecture, fallback strategies
+include (a) updating the llama.cpp checkout to the latest commit, or (b) running
+the merged fp16 weights directly via the Transformers backend on CPU.
 """
 from __future__ import annotations
 
@@ -124,19 +123,15 @@ def convert_to_gguf(
     except RuntimeError as exc:
         raise RuntimeError(
             f"{exc}\n\n"
-            "This almost always means the llama.cpp converter does not yet know this\n"
-            "architecture. Options:\n"
-            "  1. Update the checkout:  git -C "
+            "This usually indicates the llama.cpp converter does not yet support this architecture.\n"
+            "Options:\n"
+            "  1. Update checkout:  git -C "
             f"{llama_dir} pull && bash scripts/build_llama_cpp.sh\n"
             "  2. Check the architecture string in "
             f"{merged / 'config.json'} against llama.cpp's supported list.\n"
-            "  3. For laptop testing in the meantime, run the merged fp16 weights "
-            "through the 'hf' backend on CPU:\n"
+            "  3. Alternatively, evaluate the merged fp16 weights via the 'hf' backend on CPU:\n"
             f"     python app.py predict --config <cfg> --backend hf "
             f"--model-path {merged} --limit 50\n"
-            "Record this limitation in the thesis -- GGUF support for very recent\n"
-            "architectures lagging upstream is a legitimate finding about the\n"
-            "practical viability of edge deployment."
         ) from exc
 
     if quant.upper() in {"F16", "F32"}:

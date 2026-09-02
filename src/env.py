@@ -1,7 +1,8 @@
 """Environment introspection -- powers `python app.py doctor`.
 
-The point is to catch the failure modes that waste a Colab session: no GPU,
-bf16 assumed on a T4, bitsandbytes missing, no HF token, dataset not pulled.
+The point is to catch common failure modes in resource-constrained or Colab
+environments: no GPU, bf16 assumed on a T4, bitsandbytes missing, missing HF
+token, or unpulled dataset files.
 """
 from __future__ import annotations
 
@@ -181,7 +182,7 @@ def _warnings(r: Dict[str, Any]) -> List[str]:
     if not t["available"]:
         warns.append("PyTorch is not installed -- training and HF inference are unavailable.")
     elif not t["cuda"]:
-        warns.append("No CUDA device. Fine-tuning is not practical here; use Colab for training.")
+        warns.append("No CUDA device detected. Fine-tuning is not practical on CPU; consider using a GPU instance such as Colab.")
     else:
         if not t["bf16_supported"]:
             warns.append(
@@ -190,8 +191,8 @@ def _warnings(r: Dict[str, Any]) -> List[str]:
             )
         if t["total_vram_gb"] and t["total_vram_gb"] < 20:
             warns.append(
-                f"Only {t['total_vram_gb']} GB VRAM. Keep 4-bit quantisation on, "
-                "gradient checkpointing on, and per-device batch size small."
+                f"Detected {t['total_vram_gb']} GB VRAM. Maintain 4-bit quantization, "
+                "gradient checkpointing, and small per-device batch sizes."
             )
 
     if r["packages"].get("bitsandbytes") == "MISSING" and t.get("cuda"):
@@ -219,7 +220,7 @@ def render_report(r: Dict[str, Any]) -> str:
     add = lines.append
 
     add("=" * 68)
-    add("  Text2Cypher capstone -- environment report")
+    add("  Text2Cypher -- environment report")
     add("=" * 68)
     add(f"Python          : {r['python']}")
     add(f"Platform        : {r['platform']}")

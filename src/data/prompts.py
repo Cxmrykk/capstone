@@ -1,8 +1,7 @@
 """Prompt construction and output parsing.
 
-The instruction text is taken verbatim from Ozsoy et al. (2025), Table 3, so
-our zero-shot baselines are directly comparable to the published numbers for
-the same dataset.
+Instruction text follows Ozsoy et al. (2025), Table 3, to maintain comparability
+with published benchmarks for the text2cypher-2024v1 dataset.
 """
 from __future__ import annotations
 
@@ -77,8 +76,7 @@ def render_prompt(
     """Render the final prompt string, including the generation prefix.
 
     Both the HF and llama.cpp backends call this, guaranteeing byte-identical
-    prompts across backends -- otherwise the laptop-vs-Colab comparison is
-    meaningless.
+    prompts across backends for consistent evaluation.
     """
     if supports_system_role is None:
         supports_system_role = template_supports_system(tokenizer)

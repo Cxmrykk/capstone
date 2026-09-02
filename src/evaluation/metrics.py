@@ -1,8 +1,8 @@
 """Translation-based metrics and query complexity classification.
 
-Google-BLEU (GLEU) is implemented here rather than pulled from `evaluate`,
-which downloads a metric script at runtime -- an avoidable network dependency
-on a flaky Colab session, and unusable offline on the laptop.
+Google-BLEU (GLEU) is implemented directly here rather than pulled from `evaluate`
+to avoid runtime network dependencies on Colab sessions and ensure offline
+evaluation capability.
 
 GLEU follows Wu et al. (2016): for n = 1..4, take the total n-gram overlap
 between hypothesis and reference, then take the minimum of
@@ -137,8 +137,8 @@ class Complexity:
 
 
 def classify_complexity(cypher: str) -> Complexity:
-    """Heuristic difficulty label, so results can be broken down the way the
-    benchmark literature does (easy / medium / hard / extra_hard)."""
+    """Heuristic difficulty label to segment results across complexity tiers
+    (easy / medium / hard / extra_hard)."""
     text = cypher or ""
     hops = len(_REL_RE.findall(text))
     matches = len(_MATCH_RE.findall(text))

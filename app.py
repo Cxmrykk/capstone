@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Capstone entrypoint: fine-tuning lightweight LLMs for Text2Cypher.
+Text2Cypher toolkit: fine-tuning and evaluating lightweight LLMs for graph databases.
 
 Usage:
     python app.py doctor
@@ -35,7 +35,7 @@ log = get_logger(__name__)
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="app.py",
-        description="Text2Cypher capstone toolkit (UTS 41030).",
+        description="Text2Cypher toolkit: fine-tuning and evaluating lightweight LLMs for graph databases.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Debug-level logging.")
@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--resume", default="auto", choices=["auto", "hub", "local", "none"])
     t.add_argument("--max-steps", type=int, default=None)
     t.add_argument("--time-limit", type=float, default=None,
-                   help="Stop and checkpoint after N minutes (Colab session budget).")
+                   help="Stop and checkpoint after N minutes (useful for Colab session budgets).")
     t.add_argument("--schema-mode", default=None)
     t.add_argument("--max-train-samples", type=int, default=None)
     t.add_argument("--hub-repo", default=None)

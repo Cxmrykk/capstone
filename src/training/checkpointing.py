@@ -1,8 +1,8 @@
-"""Hub-backed checkpoint continuity for account-cycled Colab sessions.
+"""Hub-backed checkpoint continuity for ephemeral or preemptible Colab sessions.
 
-The problem: a free-tier session can vanish at any moment, and the next session
-may be on a different Google account with a fresh filesystem. The fix is to
-treat a private HF model repo as the source of truth for training state.
+The problem: a free-tier session can disconnect or reset at any time with a
+fresh filesystem. The solution is to treat a private HF model repo as the
+source of truth for training state.
 
 What gets uploaded on every save:
     adapter_model.safetensors, adapter_config.json   (LoRA weights)
@@ -418,7 +418,7 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
             return control
 
     class VramLogger(TrainerCallback):
-        """Records peak VRAM -- needed for the 'constrained hardware' claims."""
+        """Records peak VRAM for hardware and memory profiling."""
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             try:

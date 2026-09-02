@@ -15,9 +15,8 @@ Two schema string dialects appear in text2cypher-2024v1:
        The relationships are the following:
        (:Person)-[:ACTED_IN]->(:Movie)
 
-The parser handles both and, crucially, degrades gracefully: if parsing fails
-we return the schema untouched rather than silently feeding the model a
-mangled context.
+The parser handles both and degrades gracefully: if parsing fails we return
+the schema untouched rather than feeding the model a mangled context.
 """
 from __future__ import annotations
 
@@ -233,9 +232,8 @@ _NUMBER = re.compile(r"\b\d[\d,.]*\b")
 def ner_mask(question: str) -> str:
     """Heuristic stand-in for NER masking (Ozsoy 2025, section 3.2).
 
-    Real NER needs spaCy or an NER model; the goal here is only to stop literal
-    entity values ("Tom Hanks", "United Kingdom") from matching schema labels.
-    Documented as a heuristic in the write-up.
+    Prevents literal entity values ("Tom Hanks", "United Kingdom") from matching
+    schema labels during exact-match pruning.
     """
     if not question:
         return ""

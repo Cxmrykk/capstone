@@ -1,4 +1,4 @@
-"""Transformers-based generation (Colab T4, or CPU on the laptop for spot checks)."""
+"""Transformers-based generation backend for GPU (e.g., Colab T4) or local CPU."""
 from __future__ import annotations
 
 import time

@@ -1,9 +1,8 @@
 """Merge a LoRA adapter into full-precision base weights.
 
 A 4-bit base cannot be merged losslessly, so the base is reloaded in fp16 and
-the adapter is merged on top. For a 4B model that needs roughly 8 GB, plus the
-same again for the save buffer -- comfortable on a Colab T4, tight on a 16 GB
-laptop. Run this on Colab and copy the GGUF down.
+the adapter is merged on top. For a 4B model this requires ~8 GB plus save buffer
+memory; it is recommended to run this on a GPU instance (e.g. Colab) before exporting.
 """
 from __future__ import annotations
 
