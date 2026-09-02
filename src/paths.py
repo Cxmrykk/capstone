@@ -1,4 +1,4 @@
-"""Path resolution that behaves identically on the ThinkPad and on Colab."""
+"""Path resolution that behaves identically on local CPU and on Colab."""
 from __future__ import annotations
 
 import os

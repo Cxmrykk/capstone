@@ -1,4 +1,4 @@
-"""llama.cpp backend for the ThinkPad (CPU inference on GGUF weights).
+"""llama.cpp backend for CPU inference on GGUF weights.
 
 We drive `llama-server` over HTTP rather than binding llama-cpp-python:
 
