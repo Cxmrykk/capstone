@@ -15,16 +15,12 @@ set -euo pipefail
 BOLD=$'\033[1m'; RESET=$'\033[0m'
 say() { echo "${BOLD}==>${RESET} $*"; }
 
-say "Installing training dependencies"
+say "Installing dependencies"
 pip install -q --upgrade pip
 pip install -q -r requirements.txt
-pip install -q -r requirements-train.txt
 
 say "Attempting Unsloth (optional -- the toolkit falls back to transformers+peft)"
 pip install -q unsloth || echo "Unsloth unavailable; continuing without it."
-
-say "Installing evaluation dependencies"
-pip install -q -r requirements-eval.txt
 
 say "Enabling fast Hub transfers"
 export HF_HUB_ENABLE_HF_TRANSFER=1

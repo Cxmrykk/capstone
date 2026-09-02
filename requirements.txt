@@ -1,5 +1,6 @@
 # Core -- needed everywhere (laptop and Colab)
-huggingface_hub[cli,hf_transfer]
+huggingface_hub
+hf_transfer
 pandas
 pyarrow
 datasets
@@ -29,7 +30,6 @@ safetensors
 
 # Execution-based evaluation against Neo4j
 neo4j>=5.20.0
-requests
 
 # Optional: enables schema_mode: similarity (embedding-based schema pruning).
 # Everything else works without it; the filter degrades to exact-match.
