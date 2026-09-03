@@ -28,11 +28,11 @@ train:
   learning_rate: 2.0e-4
   num_train_epochs: 1
   max_steps: -1
-  # Gemma has a 262k vocab size. Batch size MUST be 1 on 16GB T4 GPUs to prevent
-  # logit tensor OOM spikes during the forward pass.
-  per_device_train_batch_size: 1
-  per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 16
+  # Increased micro-batch size for 24GB+ VRAM on GCP (L4/A100)
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  # Lowered accumulation steps to maintain the target effective batch size of 16
+  gradient_accumulation_steps: 4
   warmup_ratio: 0.03
   lr_scheduler_type: cosine
   optim: paged_adamw_8bit
@@ -61,4 +61,3 @@ generation:
 
 neo4j:
   provider: demo
-
