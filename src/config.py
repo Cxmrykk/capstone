@@ -90,14 +90,15 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         local_dirname="granite-4.2-3b",
         family="granite",
         attn_implementation="sdpa",
-        # The repository ships a reasoning parser, so the template may expose a
-        # thinking switch. Both common variable names are set to False; unused
-        # Jinja variables are ignored, and render_prompt drops enable_thinking
-        # when the template does not reference it.
-        chat_template_kwargs={"thinking": False, "enable_thinking": False},
+        # The Granite chat template reads only `enable_thinking` (default True).
+        # With False, the generation prompt ends in "<think></think>", matching
+        # how the template formats assistant turns, so training and inference
+        # prompts agree and no reasoning block is generated.
+        chat_template_kwargs={"enable_thinking": False},
         supports_system_role=True,
-        notes="Text-only control model used to separate model-family effects "
-              "from the unusual Gemma 4 / Qwen3.5 architectures.",
+        notes="Dense decoder-only control model (GraniteForCausalLM, 40 layers, GQA, "
+              "untied embeddings) used to separate model-family effects from the "
+              "unusual Gemma 4 / Qwen3.5 architectures.",
     ),
 }
 
