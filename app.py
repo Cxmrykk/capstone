@@ -12,6 +12,9 @@ Usage:
     python app.py export gguf --merged artifacts/merged/<name> --quant Q4_K_M
     python app.py checkpoint list --config ...
     python app.py checkpoint pull --config ... --step final
+
+Exit codes for `train`: 0 finished, 2 config drift vs remote checkpoint,
+3 non-finite loss, 4 paused at the time limit (resume with --resume auto).
 """
 from __future__ import annotations
 
@@ -203,9 +206,30 @@ def cmd_data(args) -> int:
     raise SystemExit(f"Unknown data subcommand: {args.data_command}")
 
 
+def _preimport_unsloth(cfg) -> None:
+    """Imports Unsloth before transformers/peft when the config may use it.
+
+    Unsloth patches both libraries at import time. If they are imported first
+    (run_training imports transformers before the model loader tries Unsloth),
+    Unsloth warns and its optimisations are only partially applied. Only
+    configs with use_unsloth auto/yes (the Qwen configs) are affected.
+    """
+    if cfg.model.use_unsloth == "no":
+        return
+    if "transformers" in sys.modules or "peft" in sys.modules:
+        log.debug("transformers/peft already imported; Unsloth optimisations may be partial.")
+    try:
+        import unsloth  # noqa: F401
+    except Exception as exc:
+        if cfg.model.use_unsloth == "yes":
+            log.warning("use_unsloth=yes but Unsloth failed to import: %s", exc)
+        else:
+            log.info("Unsloth not available (%s); training will use Transformers + PEFT.",
+                     type(exc).__name__)
+
+
 def cmd_train(args) -> int:
     from src.config import load_config
-    from src.training.train import run_training
 
     cfg = load_config(args.config)
     if args.run_name:
@@ -224,6 +248,11 @@ def cmd_train(args) -> int:
         cfg.hub.sync = False
     if args.output_dir:
         cfg.output_dir = args.output_dir
+
+    # Must happen before src.training.train is imported (it pulls in transformers).
+    _preimport_unsloth(cfg)
+
+    from src.training.train import run_training
 
     run_training(cfg, resume=args.resume)
     return 0

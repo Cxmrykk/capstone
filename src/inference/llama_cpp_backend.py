@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.config import RunConfig
+from src.data.prompts import strip_leading_bos
 from src.inference.base import GenerationBackend
 from src.logging_utils import get_logger
 
@@ -191,8 +192,10 @@ class LlamaCppBackend(GenerationBackend):
         session = requests.Session()
 
         for i, prompt in enumerate(prompts):
+            # llama-server prepends BOS itself when the GGUF metadata asks for it,
+            # so a BOS already present in the rendered prompt would be doubled.
             payload = {
-                "prompt": prompt,
+                "prompt": strip_leading_bos(self._tokenizer, prompt),
                 "n_predict": max_new_tokens,
                 "temperature": float(temperature),
                 "top_p": self.cfg.generation.top_p,

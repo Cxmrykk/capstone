@@ -6,21 +6,35 @@ connectivity.
 """
 from __future__ import annotations
 
-import importlib
 import os
 import platform
 import shutil
 import subprocess
 import sys
+from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from src.paths import artifacts_dir, data_dir, dataset_dir, is_colab, repo_root
 
-_PACKAGES = [
-    "torch", "transformers", "peft", "accelerate", "bitsandbytes", "datasets",
-    "huggingface_hub", "unsloth", "neo4j", "yaml", "pandas", "pyarrow",
-    "sentence_transformers", "requests",
+# (display name, distribution name). Versions are read from package metadata,
+# never by importing: importing unsloth after transformers/peft prints an
+# import-order warning and patches both libraries inside this process.
+_PACKAGES: List[Tuple[str, str]] = [
+    ("torch", "torch"),
+    ("transformers", "transformers"),
+    ("peft", "peft"),
+    ("accelerate", "accelerate"),
+    ("bitsandbytes", "bitsandbytes"),
+    ("datasets", "datasets"),
+    ("huggingface_hub", "huggingface_hub"),
+    ("unsloth", "unsloth"),
+    ("neo4j", "neo4j"),
+    ("yaml", "PyYAML"),
+    ("pandas", "pandas"),
+    ("pyarrow", "pyarrow"),
+    ("sentence_transformers", "sentence-transformers"),
+    ("requests", "requests"),
 ]
 
 # Models supported on the 16 GB T4: the two 2B models under study plus the
@@ -29,13 +43,15 @@ _MODEL_DIRS = ["gemma-4-E2B", "Qwen3.5-2B", "granite-4.2-3b"]
 
 
 def _package_versions() -> Dict[str, str]:
+    """Reads installed package versions from metadata without importing them."""
     out: Dict[str, str] = {}
-    for name in _PACKAGES:
+    for label, dist in _PACKAGES:
         try:
-            mod = importlib.import_module(name)
-            out[name] = str(getattr(mod, "__version__", "installed"))
+            out[label] = importlib_metadata.version(dist)
+        except importlib_metadata.PackageNotFoundError:
+            out[label] = "MISSING"
         except Exception:
-            out[name] = "MISSING"
+            out[label] = "unknown"
     return out
 
 
@@ -192,8 +208,8 @@ def _warnings(r: Dict[str, Any]) -> List[str]:
         if not t["bf16_supported"]:
             warns.append(
                 f"{t['device_name']} (sm_{t['capability']}) does not support bfloat16. "
-                "Training uses fp16 automatically; Gemma configs disable Unsloth because it "
-                "upcasts Gemma 4 to fp32 on this hardware. Expected on a T4."
+                "Training uses fp16 automatically; the Gemma and Granite configs disable Unsloth "
+                "(it upcasts Gemma 4 to fp32 on this hardware). Expected on a T4."
             )
         if t["total_vram_gb"] and t["total_vram_gb"] < 20:
             warns.append(

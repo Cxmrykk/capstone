@@ -67,6 +67,37 @@ def template_supports_thinking(tokenizer) -> bool:
     return "enable_thinking" in src
 
 
+def tokenizer_wants_bos(tokenizer) -> bool:
+    """True when the tokenizer would normally prepend a BOS token.
+
+    Every tokenizer call in this project uses add_special_tokens=False, so the
+    prompt text itself must carry the BOS token when the model expects one.
+    Chat templates (e.g. Gemma's) usually include it; the plain-text fallback
+    does not, which matters for base checkpoints shipped without a template.
+    """
+    bos = getattr(tokenizer, "bos_token", None)
+    if not bos:
+        return False
+    flag = getattr(tokenizer, "add_bos_token", None)
+    if isinstance(flag, bool):
+        return flag
+    try:
+        ids = tokenizer(text="x", add_special_tokens=True)["input_ids"]
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return bool(ids) and ids[0] == tokenizer.bos_token_id
+    except Exception:
+        return False
+
+
+def strip_leading_bos(tokenizer, prompt: str) -> str:
+    """Removes a leading BOS token string (for servers that add their own BOS)."""
+    bos = getattr(tokenizer, "bos_token", None)
+    if bos and prompt.startswith(bos):
+        return prompt[len(bos):]
+    return prompt
+
+
 def render_prompt(
     tokenizer,
     question: str,
@@ -102,8 +133,10 @@ def render_prompt(
                 log.warning("Chat template unusable (%s); falling back to plain text formatting.", exc2)
 
     # Plain text fallback for base models lacking a dedicated chat template
+    # (e.g. google/gemma-4-E2B). Gemma degrades badly without a leading BOS.
     body = "\n\n".join(m["content"] for m in messages)
-    return f"{body}\n"
+    prefix = tokenizer.bos_token if tokenizer_wants_bos(tokenizer) else ""
+    return f"{prefix}{body}\n"
 
 
 # --------------------------------------------------------------------------- #

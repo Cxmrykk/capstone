@@ -52,8 +52,10 @@ def setup_logging(level: str = "INFO") -> None:
     root.addHandler(handler)
     root.setLevel(level)
 
-    # These libraries are extremely chatty at INFO.
-    for noisy in ("urllib3", "filelock", "neo4j", "httpx", "datasets", "huggingface_hub"):
+    # These libraries are extremely chatty at INFO. numexpr logs
+    # "NumExpr defaulting to N threads" whenever pandas pulls it in.
+    for noisy in ("urllib3", "filelock", "neo4j", "httpx", "datasets", "huggingface_hub",
+                  "numexpr"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     _CONFIGURED = True

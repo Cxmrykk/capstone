@@ -8,6 +8,9 @@ vocabularies, so a full [batch, seq_len, vocab] logits tensor (plus its fp32
 copy inside cross-entropy) dominates VRAM. Prompt tokens are masked out of the
 loss anyway, so TargetOnlyLossTrainer asks the model for logits over only the
 trailing positions that contain target Cypher tokens.
+
+Exit codes raised here: 3 = non-finite loss, 4 = paused at the wall-clock
+limit before the schedule finished (resume with --resume auto).
 """
 from __future__ import annotations
 
@@ -41,6 +44,9 @@ from src.training.model_loader import (
 )
 
 log = get_logger(__name__)
+
+EXIT_NONFINITE_LOSS = 3
+EXIT_TIME_LIMIT = 4
 
 
 # --------------------------------------------------------------------------- #
@@ -351,7 +357,24 @@ def run_training(cfg: RunConfig, resume: str = "auto") -> Path:
         )
         if sync is not None:
             sync.wait()
-        raise SystemExit(3)
+        raise SystemExit(EXIT_NONFINITE_LOSS)
+
+    # A wall-clock stop (Colab session budget) returns from trainer.train()
+    # normally, but the adapter is only partially trained. Writing it as "final"
+    # would let predict/merge -- and the notebook's skip-if-final logic -- treat
+    # an unfinished run as complete. The checkpoint saved at the stop is enough
+    # to resume.
+    state = trainer.state
+    if state.max_steps and state.global_step < state.max_steps:
+        if sync is not None:
+            sync.wait()
+        log.warning(
+            "Training paused at step %d/%d (time limit reached). The checkpoint was saved %s. "
+            "Rerun with --resume auto to continue. No final adapter was written.",
+            state.global_step, state.max_steps,
+            "and synced to the Hub" if sync is not None else "locally only",
+        )
+        raise SystemExit(EXIT_TIME_LIMIT)
 
     # Final artifact export
     final_dir = output_dir / "final"
