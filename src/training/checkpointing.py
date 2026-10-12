@@ -1,12 +1,13 @@
 """Remote checkpoint synchronization and state recovery for ephemeral environments.
 
-Ensures training state continuity on preemptible GPU instances (such as Google Colab
-free sessions or cloud spot VMs) by synchronizing LoRA weights and optimizer states
-to a private Hugging Face Model Hub repository.
+Ensures training state continuity on preemptible GPU instances (Google Colab
+free sessions) by synchronizing LoRA weights and optimizer states to a private
+Hugging Face Model Hub repository.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -268,6 +269,42 @@ class HubCheckpointSync:
         log.info("Checkpoint ready at %s", resolved)
         return resolved
 
+    def pull_final(self, dest: str | Path) -> Optional[Path]:
+        """Downloads runs/<run_name>/final into `dest` (e.g. artifacts/runs/<run>/final).
+
+        Lets a fresh Colab session run predict/merge on an adapter that finished
+        training in an earlier session.
+        """
+        from huggingface_hub import snapshot_download
+
+        staging = ensure_dir(artifacts_dir() / "hub_pull" / self.run_name)
+        prefix = f"{self.run_prefix}/final"
+        log.info("Downloading %s from %s ...", prefix, self.repo_id)
+        try:
+            snapshot_download(
+                repo_id=self.repo_id,
+                repo_type="model",
+                token=self.token,
+                allow_patterns=[f"{prefix}/*"],
+                local_dir=str(staging),
+            )
+        except Exception as exc:
+            log.error("Could not download final adapter: %s", exc)
+            return None
+
+        src = staging / self.run_prefix / "final"
+        if not src.exists() or not any(src.iterdir()):
+            log.info("No final adapter found for run '%s'.", self.run_name)
+            return None
+
+        dest = Path(dest)
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dest)
+        log.info("Final adapter ready at %s", dest)
+        return dest
+
     def prune(self, keep_last: int, protect_step: Optional[int] = None) -> None:
         """Removes older remote checkpoints to maintain the target retention count."""
         if keep_last <= 0:
@@ -327,7 +364,7 @@ class HubCheckpointSync:
 # --------------------------------------------------------------------------- #
 def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
                     fingerprint: str):
-    """Assembles custom Hugging Face Trainer callbacks for logging and remote sync."""
+    """Assembles custom Hugging Face Trainer callbacks for logging, safety and remote sync."""
     from transformers import TrainerCallback
     from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
@@ -380,6 +417,42 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
                 control.should_training_stop = True
             return control
 
+    class NonFiniteLossGuard(TrainerCallback):
+        """Stops training when fp16 loss stays NaN/inf for several consecutive logs.
+
+        T4 GPUs have no bf16, so training runs in fp16. The GradScaler absorbs
+        occasional overflow, but a persistently non-finite loss means the run
+        is diverging and the adapter would be useless.
+        """
+
+        is_nonfinite_guard = True
+
+        def __init__(self, patience: int) -> None:
+            self.patience = max(1, int(patience))
+            self.consecutive = 0
+            self.tripped = False
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs or "loss" not in logs:
+                return control
+            try:
+                value = float(logs["loss"])
+            except (TypeError, ValueError):
+                return control
+            if math.isfinite(value):
+                self.consecutive = 0
+                return control
+            self.consecutive += 1
+            log.warning("Non-finite training loss at step %d (%d/%d).",
+                        state.global_step, self.consecutive, self.patience)
+            if self.consecutive >= self.patience:
+                self.tripped = True
+                log.error("Loss non-finite for %d consecutive logs; stopping training.",
+                          self.consecutive)
+                control.should_training_stop = True
+                control.should_save = False
+            return control
+
     class JsonlLossLogger(TrainerCallback):
         """Logs training metrics to metrics.jsonl for analysis."""
 
@@ -416,8 +489,10 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
         callbacks.append(HubCheckpointCallback())
     if cfg.train.time_limit_minutes:
         callbacks.append(WallClockLimitCallback(cfg.train.time_limit_minutes))
-    callbacks.append(JsonlLossLogger(cfg.resolved_output_dir() / "metrics.jsonl"))
+    if cfg.train.nan_guard_patience and cfg.train.nan_guard_patience > 0:
+        callbacks.append(NonFiniteLossGuard(cfg.train.nan_guard_patience))
     callbacks.append(VramLogger())
+    callbacks.append(JsonlLossLogger(cfg.resolved_output_dir() / "metrics.jsonl"))
     return callbacks
 
 

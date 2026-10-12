@@ -1,12 +1,13 @@
-# Standard configuration: Qwen3.5-2B with full annotated schema context.
-# Optimized for 16 GB GPU environments (e.g. Google Colab T4, fp16 compute).
+# Qwen3.5-2B with full annotated schema context.
+# Sized for a single 16 GB NVIDIA T4 (Google Colab free tier, fp16 compute).
 run_name: qwen3.5-2b-enhanced
 
 model:
   key: qwen3.5-2b
   load_in_4bit: true
   attn_implementation: auto
-  use_unsloth: auto          # Automatically falls back to Transformers + PEFT if unsupported
+  use_unsloth: auto          # Falls back to Transformers + PEFT if Unsloth is missing or fails
+  upcast_frozen_params: false
 
 data:
   schema_mode: enhanced      # Options: enhanced | base | exact_match | ner_exact_match | similarity | none
@@ -14,7 +15,7 @@ data:
   val_fraction: 0.02
   max_val_samples: 400
   max_train_samples: null    # null uses all training instances
-  max_eval_samples: 1000     # Evaluation sample limit for validation/testing
+  max_eval_samples: 1000
   seed: 3407
 
 lora:
@@ -30,25 +31,27 @@ train:
   max_steps: -1
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
-  gradient_accumulation_steps: 8      # Effective batch size: 16
+  gradient_accumulation_steps: 8       # Effective batch size: 16
   warmup_ratio: 0.03
   lr_scheduler_type: cosine
   optim: paged_adamw_8bit
   weight_decay: 0.01
   max_grad_norm: 0.3
   logging_steps: 10
-  save_steps: 50                       # Checkpoint save and remote sync frequency
+  save_steps: 50
   eval_steps: 250
   save_total_limit: 2
   gradient_checkpointing: true
   group_by_length: false
   dataloader_num_workers: 2
   seed: 3407
-  time_limit_minutes: 210              # Cleanly stops and checkpoints before session timeouts
-  report_to: []                        # Optional tracking integrations, e.g. ["wandb"]
+  time_limit_minutes: 210
+  target_only_loss: true               # Used when Unsloth is not active
+  nan_guard_patience: 3
+  report_to: []
 
 hub:
-  repo_id: null              # Target repository, e.g. "username/text2cypher-checkpoints"
+  repo_id: null
   private: true
   sync: true
   keep_last: 2

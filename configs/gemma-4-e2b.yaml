@@ -1,12 +1,17 @@
+# Gemma 4 E2B with full annotated schema context.
+# Sized for a single 16 GB NVIDIA T4 (Google Colab free tier, fp16 compute).
 run_name: gemma-4-e2b-enhanced
 
 model:
   key: gemma-4-e2b
   load_in_4bit: true
-  # Gemma architectures utilize final logit soft-capping; eager attention is used
-  # to maintain numerical stability during training and inference.
-  attn_implementation: auto
-  use_unsloth: auto
+  attn_implementation: auto        # Resolves to sdpa via the model registry
+  # Unsloth rejects fp16 for Gemma 4 on Turing and silently upcasts to fp32,
+  # which caused the loss-step OOM in history/014.md. Plain Transformers + PEFT
+  # with the target-only loss avoids that. Must be quoted: bare `no` is a YAML boolean.
+  use_unsloth: "no"
+  # Keep frozen weights (incl. Gemma's per-layer embedding tables) in fp16.
+  upcast_frozen_params: false
 
 data:
   schema_mode: enhanced
@@ -28,11 +33,9 @@ train:
   learning_rate: 2.0e-4
   num_train_epochs: 1
   max_steps: -1
-  # Increased micro-batch size for 24GB+ VRAM on GCP (L4/A100)
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
-  # Lowered accumulation steps to maintain the target effective batch size of 16
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16      # Effective batch size: 16
   warmup_ratio: 0.03
   lr_scheduler_type: cosine
   optim: paged_adamw_8bit
@@ -45,11 +48,13 @@ train:
   gradient_checkpointing: true
   dataloader_num_workers: 2
   seed: 3407
-  time_limit_minutes: 210
+  time_limit_minutes: 210              # Stop and checkpoint before Colab reclaims the GPU
+  target_only_loss: true               # Only materialise logits over the Cypher target
+  nan_guard_patience: 3                # Stop if fp16 loss is non-finite for 3 consecutive logs
   report_to: []
 
 hub:
-  repo_id: null
+  repo_id: null                        # Set via T2C_HUB_REPO in the notebook
   private: true
   sync: true
   keep_last: 2
@@ -57,7 +62,7 @@ hub:
 generation:
   max_new_tokens: 256
   temperature: 0.0
-  batch_size: 8
+  batch_size: 4
 
 neo4j:
   provider: demo

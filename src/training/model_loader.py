@@ -1,13 +1,12 @@
 """Model initialization, tokenizer configuration, and LoRA target module discovery.
 
-Handles device-aware precision selection (detecting fp16 on Nvidia Turing T4 vs
-bf16 on Ampere+ architectures), automatic discovery of linear projection layers
-for LoRA parameter injection, and optional acceleration via Unsloth.
+Handles device-aware precision selection (fp16 on NVIDIA Turing T4, bf16 on
+Ampere+), automatic discovery of linear projection layers for LoRA injection,
+memory-lean k-bit preparation for 16 GB GPUs, and optional Unsloth acceleration.
 """
 from __future__ import annotations
 
 import inspect
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import RunConfig
@@ -142,6 +141,53 @@ def resolve_target_modules(model, cfg: RunConfig):
 
 
 # --------------------------------------------------------------------------- #
+# k-bit Preparation
+# --------------------------------------------------------------------------- #
+def _prepare_kbit_lean(model, gradient_checkpointing: bool) -> None:
+    """Memory-lean replacement for peft.prepare_model_for_kbit_training.
+
+    PEFT's helper upcasts every non-quantized parameter to fp32. On Gemma 4 that
+    includes the per-layer embedding tables (billions of parameters), which on its
+    own is enough to exhaust a 16 GB T4. Here frozen weights stay in the load
+    dtype; only the LoRA weights are trained, in fp32 (see _upcast_trainable_to_fp32).
+    """
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    if gradient_checkpointing:
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
+
+    if hasattr(model, "enable_input_require_grads"):
+        try:
+            model.enable_input_require_grads()
+        except Exception as exc:
+            log.debug("enable_input_require_grads failed (%s); continuing.", exc)
+
+
+def _upcast_trainable_to_fp32(model) -> int:
+    """Casts any half-precision trainable parameters to fp32.
+
+    fp16 mixed precision uses a GradScaler, which refuses to unscale fp16
+    gradients. Adapters are tiny, so fp32 copies cost almost nothing.
+    """
+    import torch
+
+    count = 0
+    for param in model.parameters():
+        if param.requires_grad and param.dtype in (torch.float16, torch.bfloat16):
+            param.data = param.data.float()
+            count += 1
+    if count:
+        log.info("Upcast %d trainable tensors to fp32 for mixed-precision training.", count)
+    return count
+
+
+# --------------------------------------------------------------------------- #
 # Base Model Loading
 # --------------------------------------------------------------------------- #
 def _quant_config(cfg: RunConfig):
@@ -203,7 +249,8 @@ def _load_base_model(cfg: RunConfig, quantize: bool, dtype, for_training: bool):
         except Exception as exc:
             last_error = exc
             log.debug("%s failed for %s: %s", class_name, path, exc)
-            if "attn_implementation" in str(exc) or "flash" in str(exc).lower():
+            if "attn_implementation" in str(exc) or "sdpa" in str(exc).lower() \
+                    or "flash" in str(exc).lower():
                 kwargs["attn_implementation"] = "eager"
 
     raise RuntimeError(
@@ -215,6 +262,7 @@ def _load_base_model(cfg: RunConfig, quantize: bool, dtype, for_training: bool):
 def _try_unsloth(cfg: RunConfig, for_training: bool):
     """Attempts Unsloth acceleration; returns None if unsupported or unavailable."""
     if cfg.model.use_unsloth == "no":
+        log.info("Unsloth disabled by config (use_unsloth: no).")
         return None
     try:
         from unsloth import FastLanguageModel
@@ -252,8 +300,6 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
                              adapter_path: Optional[str] = None,
                              model_path_override: Optional[str] = None):
     """Initializes and returns (model, tokenizer, metadata)."""
-    import torch
-
     if model_path_override:
         cfg.model.path = model_path_override
 
@@ -294,6 +340,8 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
         log.info("Loading LoRA adapter weights from %s", adapter_path)
         model = PeftModel.from_pretrained(model, adapter_path, is_trainable=for_training)
         meta["adapter"] = adapter_path
+        if for_training:
+            _upcast_trainable_to_fp32(model)
         _finalise(model, tokenizer, cfg, for_training)
         return model, tokenizer, meta
 
@@ -301,11 +349,14 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
         if cfg.model.load_in_4bit:
-            model = prepare_model_for_kbit_training(
-                model,
-                use_gradient_checkpointing=cfg.train.gradient_checkpointing,
-                gradient_checkpointing_kwargs={"use_reentrant": False},
-            )
+            if cfg.model.upcast_frozen_params:
+                model = prepare_model_for_kbit_training(
+                    model,
+                    use_gradient_checkpointing=cfg.train.gradient_checkpointing,
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                )
+            else:
+                _prepare_kbit_lean(model, cfg.train.gradient_checkpointing)
         elif cfg.train.gradient_checkpointing:
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -322,6 +373,7 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
             modules_to_save=cfg.lora.modules_to_save,
         )
         model = get_peft_model(model, peft_cfg)
+        _upcast_trainable_to_fp32(model)
         meta["target_modules"] = targets
         try:
             model.print_trainable_parameters()

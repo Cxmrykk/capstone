@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.config import RunConfig
-from src.data.dataset import load_raw_split, subsample, write_jsonl
+from src.data.dataset import _flatten_ids, load_raw_split, subsample, write_jsonl
 from src.data.prompts import extract_cypher, render_prompt, template_supports_system
 from src.data.schema_filter import apply_schema_mode
 from src.inference import get_backend
@@ -29,6 +29,14 @@ def _default_out_name(cfg: RunConfig, backend_name: str, split: str,
     return f"{label}__{cfg.model.key}__{cfg.data.schema_mode}__{backend_name}__{split}__{stamp}.jsonl"
 
 
+def _count_tokens(tokenizer, prompt: str) -> int:
+    """Counts prompt tokens; text= avoids multimodal processors treating input as an image."""
+    try:
+        return len(_flatten_ids(tokenizer(text=prompt, add_special_tokens=False)["input_ids"]))
+    except Exception:
+        return -1
+
+
 def run_prediction(
     cfg: RunConfig,
     backend_name: str = "hf",
@@ -42,6 +50,13 @@ def run_prediction(
     tag: Optional[str] = None,
 ) -> Path:
     """Runs generation across an evaluation split and outputs predictions with metadata."""
+    if adapter and not Path(adapter).exists():
+        raise FileNotFoundError(
+            f"Adapter not found: {adapter}\n"
+            "If training finished in an earlier Colab session, download it first:\n"
+            f"  python app.py checkpoint pull --config <cfg> --step final"
+        )
+
     records = load_raw_split(split, cfg.data.dataset_dir)
     limit = limit if limit is not None else cfg.data.max_eval_samples
     records = subsample(records, limit, cfg.data.seed)
@@ -87,10 +102,7 @@ def run_prediction(
         )
         prompts.append(prompt)
         schema_texts.append(schema_text)
-        try:
-            prompt_tokens.append(len(tokenizer(prompt, add_special_tokens=False)["input_ids"]))
-        except Exception:
-            prompt_tokens.append(-1)
+        prompt_tokens.append(_count_tokens(tokenizer, prompt))
 
     t0 = time.time()
     raw_outputs = backend.generate(
@@ -100,6 +112,7 @@ def run_prediction(
         batch_size=cfg.generation.batch_size,
     )
     elapsed = time.time() - t0
+    backend_info = backend.info()
     backend.close()
 
     rows: List[Dict[str, Any]] = []
@@ -122,6 +135,7 @@ def run_prediction(
     )
     write_jsonl(out, rows)
 
+    valid_tokens = [t for t in prompt_tokens if t >= 0]
     meta = {
         "run_name": cfg.run_name,
         "tag": tag,
@@ -130,7 +144,7 @@ def run_prediction(
         "adapter": adapter,
         "gguf": gguf,
         "backend": backend_name,
-        "backend_info": backend.info(),
+        "backend_info": backend_info,
         "split": split,
         "n_instances": len(rows),
         "schema_mode": cfg.data.schema_mode,
@@ -139,10 +153,7 @@ def run_prediction(
         "batch_size": cfg.generation.batch_size,
         "total_seconds": round(elapsed, 2),
         "seconds_per_item": round(elapsed / max(1, len(rows)), 3),
-        "mean_prompt_tokens": (
-            round(sum(t for t in prompt_tokens if t >= 0) /
-                  max(1, sum(1 for t in prompt_tokens if t >= 0)), 1)
-        ),
+        "mean_prompt_tokens": round(sum(valid_tokens) / max(1, len(valid_tokens)), 1),
         "host": platform.node(),
         "platform": platform.platform(),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),

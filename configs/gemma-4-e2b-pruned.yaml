@@ -1,19 +1,24 @@
-run_name: gemma-4-e4b-enhanced
+# Gemma 4 E2B with dynamic exact-match schema pruning.
+# Mirrors qwen3.5-2b-pruned.yaml so the schema-filtering ablation covers both model families.
+run_name: gemma-4-e2b-exact-match
 
 model:
-  key: gemma-4-e4b
+  key: gemma-4-e2b
   load_in_4bit: true
   attn_implementation: auto
-  use_unsloth: auto
+  use_unsloth: "no"
+  upcast_frozen_params: false
 
 data:
-  schema_mode: enhanced
+  schema_mode: exact_match
   max_seq_length: 2048
   val_fraction: 0.02
   max_val_samples: 400
   max_train_samples: null
   max_eval_samples: 1000
   seed: 3407
+  filter_min_nodes: 1
+  filter_keep_all_patterns_for_kept_nodes: true
 
 lora:
   r: 16
@@ -26,11 +31,9 @@ train:
   learning_rate: 2.0e-4
   num_train_epochs: 1
   max_steps: -1
-  # Increased micro-batch size to leverage 24GB VRAM on GCP L4
-  per_device_train_batch_size: 2
-  per_device_eval_batch_size: 2
-  # Lowered accumulation steps to maintain the target effective batch size of 16
-  gradient_accumulation_steps: 8
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
   warmup_ratio: 0.03
   lr_scheduler_type: cosine
   optim: paged_adamw_8bit
@@ -44,6 +47,8 @@ train:
   dataloader_num_workers: 2
   seed: 3407
   time_limit_minutes: 210
+  target_only_loss: true
+  nan_guard_patience: 3
   report_to: []
 
 hub:

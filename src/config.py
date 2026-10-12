@@ -2,6 +2,9 @@
 
 Encapsulates all runtime, training, data processing, generation, and evaluation
 parameters to ensure reproducible runs via YAML files and CLI overrides.
+
+Only 2B-parameter models are registered: the project targets a single 16 GB
+NVIDIA T4 (Google Colab free tier), on which the 4B variants do not fit.
 """
 from __future__ import annotations
 
@@ -62,16 +65,11 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         hf_id="google/gemma-4-E2B",
         local_dirname="gemma-4-E2B",
         family="gemma",
-        attn_implementation="eager",
-        supports_system_role=False,
-        notes="Multimodal architecture; adapts the core language transformer layers.",
-    ),
-    "gemma-4-e4b": ModelSpec(
-        key="gemma-4-e4b",
-        hf_id="google/gemma-4-E4B",
-        local_dirname="gemma-4-E4B",
-        family="gemma",
-        attn_implementation="eager",
+        # Gemma 4 text layers have no attention-logit softcapping (only the
+        # final_logit_softcapping applied after the LM head), so SDPA is usable
+        # and needs far less memory than eager attention at 2048 tokens. The
+        # loader falls back to eager automatically if SDPA is rejected.
+        attn_implementation="sdpa",
         supports_system_role=False,
         notes="Multimodal architecture; adapts the core language transformer layers.",
     ),
@@ -83,17 +81,7 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         attn_implementation="sdpa",
         chat_template_kwargs={"enable_thinking": False},
         supports_system_role=True,
-        notes="Hybrid attention model with standard chat template support.",
-    ),
-    "qwen3.5-4b": ModelSpec(
-        key="qwen3.5-4b",
-        hf_id="Qwen/Qwen3.5-4B",
-        local_dirname="Qwen3.5-4B",
-        family="qwen",
-        attn_implementation="sdpa",
-        chat_template_kwargs={"enable_thinking": False},
-        supports_system_role=True,
-        notes="Hybrid attention model with standard chat template support.",
+        notes="Hybrid linear/full attention model with standard chat template support.",
     ),
 }
 
@@ -102,13 +90,8 @@ MODEL_ALIASES = {
     "gemma-2b": "gemma-4-e2b",
     "gemma2b": "gemma-4-e2b",
     "gemma-e2b": "gemma-4-e2b",
-    "gemma-4b": "gemma-4-e4b",
-    "gemma4b": "gemma-4-e4b",
-    "gemma-e4b": "gemma-4-e4b",
     "qwen-2b": "qwen3.5-2b",
     "qwen2b": "qwen3.5-2b",
-    "qwen-4b": "qwen3.5-4b",
-    "qwen4b": "qwen3.5-4b",
 }
 
 
@@ -117,7 +100,10 @@ def get_model_spec(key: str) -> ModelSpec:
     norm = MODEL_ALIASES.get(norm, norm)
     if norm not in MODEL_REGISTRY:
         known = ", ".join(sorted(MODEL_REGISTRY) + sorted(MODEL_ALIASES))
-        raise KeyError(f"Unknown model key '{key}'. Supported models: {known}")
+        raise KeyError(
+            f"Unknown model key '{key}'. Supported models: {known}. "
+            "(4B models were removed: they do not fit a 16 GB T4.)"
+        )
     return MODEL_REGISTRY[norm]
 
 
@@ -135,6 +121,15 @@ class ModelConfig:
     attn_implementation: str = "auto"     # "auto" uses the ModelSpec default
     use_unsloth: str = "auto"             # "auto" | "yes" | "no"
     trust_remote_code: bool = True
+    # When true, use peft.prepare_model_for_kbit_training, which upcasts every
+    # non-quantized parameter (norms, embeddings) to fp32. Off by default: on
+    # Gemma 4 this upcasts the per-layer embedding tables and exhausts a T4.
+    upcast_frozen_params: bool = False
+
+    def __post_init__(self) -> None:
+        # YAML parses bare yes/no as booleans; normalise them back to strings.
+        if isinstance(self.use_unsloth, bool):
+            self.use_unsloth = "yes" if self.use_unsloth else "no"
 
     @property
     def spec(self) -> ModelSpec:
@@ -184,9 +179,9 @@ class TrainConfig:
     learning_rate: float = 2e-4
     num_train_epochs: float = 1.0
     max_steps: int = -1
-    per_device_train_batch_size: int = 2
-    per_device_eval_batch_size: int = 2
-    gradient_accumulation_steps: int = 8
+    per_device_train_batch_size: int = 1
+    per_device_eval_batch_size: int = 1
+    gradient_accumulation_steps: int = 16
     warmup_ratio: float = 0.03
     lr_scheduler_type: str = "cosine"
     optim: str = "paged_adamw_8bit"
@@ -201,6 +196,11 @@ class TrainConfig:
     dataloader_num_workers: int = 2
     seed: int = 3407
     time_limit_minutes: Optional[float] = None
+    # Compute logits only for the trailing positions that contain target Cypher
+    # tokens. With 248k-262k vocabularies, full-sequence logits dominate VRAM.
+    target_only_loss: bool = True
+    # Stop training after N consecutive logged non-finite losses (fp16 overflow).
+    nan_guard_patience: int = 3
     report_to: List[str] = field(default_factory=list)
 
 
@@ -281,7 +281,8 @@ class RunConfig:
             "train": {
                 k: v for k, v in dataclasses.asdict(self.train).items()
                 if k not in {"time_limit_minutes", "report_to", "save_steps",
-                             "logging_steps", "dataloader_num_workers"}
+                             "logging_steps", "dataloader_num_workers",
+                             "nan_guard_patience"}
             },
         }
         blob = json.dumps(relevant, sort_keys=True, default=str)

@@ -1,25 +1,50 @@
 #!/bin/bash
-set -e
+#
+# Download the benchmark dataset and the 2B-parameter base models.
+#
+#   bash download_data.sh          # dataset + Gemma 4 E2B + Qwen3.5-2B
+#   bash download_data.sh gemma    # dataset + Gemma 4 E2B only
+#   bash download_data.sh qwen     # dataset + Qwen3.5-2B only
+#   bash download_data.sh dataset  # dataset only
+#
+# Only 2B models are supported: 4B models do not fit the 16 GB T4 used on Colab.
+set -euo pipefail
 
-# Load .env if present
+cd "$(dirname "$0")"
+
 if [ -f .env ]; then
     echo "Loading environment variables from .env..."
-    export $(grep -v '^#' .env | xargs)
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
 fi
 
-# Enable high-performance Xet transfer engine
 export HF_XET_HIGH_PERFORMANCE=1
 
-# List of targets: "repo_type repo_id local_dir"
-# Only download the target LLM
-REPOS=(
-    "dataset neo4j/text2cypher-2024v1 data/text2cypher-2024v1"
-    "model google/gemma-4-E2B data/gemma-4-E2B"
-    # "model google/gemma-4-E4B data/gemma-4-E4B"
-    # "model Qwen/Qwen3.5-2B data/Qwen3.5-2B"
-    # "model Qwen/Qwen3.5-4B data/Qwen3.5-4B"
-)
+if ! command -v hf > /dev/null 2>&1; then
+    echo "ERROR: 'hf' CLI not found. Install with: pip install -U 'huggingface_hub[cli]'"
+    exit 1
+fi
 
+TARGET="${1:-all}"
+
+DATASET="dataset neo4j/text2cypher-2024v1 data/text2cypher-2024v1"
+GEMMA="model google/gemma-4-E2B data/gemma-4-E2B"
+QWEN="model Qwen/Qwen3.5-2B data/Qwen3.5-2B"
+
+case "$TARGET" in
+    all)     REPOS=("$DATASET" "$GEMMA" "$QWEN") ;;
+    gemma)   REPOS=("$DATASET" "$GEMMA") ;;
+    qwen)    REPOS=("$DATASET" "$QWEN") ;;
+    dataset) REPOS=("$DATASET") ;;
+    *)
+        echo "Usage: bash download_data.sh [all|gemma|qwen|dataset]"
+        exit 1
+        ;;
+esac
+
+# Sequential downloads: concurrent multi-GB pulls exhausted Colab disk/RAM (history/006.md).
 for ENTRY in "${REPOS[@]}"; do
     TYPE=$(echo "$ENTRY" | cut -d' ' -f1)
     REPO_ID=$(echo "$ENTRY" | cut -d' ' -f2)
@@ -37,5 +62,6 @@ for ENTRY in "${REPOS[@]}"; do
 done
 
 echo "=========================================="
-echo "All datasets and models downloaded successfully!"
+echo "Downloads complete ($TARGET)."
+df -h . | tail -n 1 | awk '{print "Disk free: " $4 " of " $2}'
 echo "=========================================="

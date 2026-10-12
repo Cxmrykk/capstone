@@ -28,7 +28,7 @@ else:
 def save_file(rel_in_path, out_filename, is_json=True):
     in_path = os.path.join(data_dir, rel_in_path)
     out_path = os.path.join(script_dir, out_filename)
-    
+
     if os.path.exists(in_path):
         if is_json:
             with open(in_path, "r", encoding="utf-8") as f:
@@ -41,15 +41,15 @@ def save_file(rel_in_path, out_filename, is_json=True):
                 content = f.read()
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(content)
-                
+
         print(f"✅ Saved: {out_filename}")
     else:
         print(f"❌ Missing: {rel_in_path}")
 
-# --- 2. Save Model Configs ---
-save_file("Qwen3.5-4B/config.json", "qwen_config.json")
-save_file("Qwen3.5-4B/chat_template.jinja", "qwen_chat_template.jinja", is_json=False)
-save_file("gemma-4-E4B/config.json", "gemma_config.json")
-save_file("gemma-4-E4B/tokenizer_config.json", "gemma_tokenizer_config.json")
+# --- 2. Save Model Configs (2B models only; 4B models are out of scope on a T4) ---
+save_file("Qwen3.5-2B/config.json", "qwen_config.json")
+save_file("Qwen3.5-2B/chat_template.jinja", "qwen_chat_template.jinja", is_json=False)
+save_file("gemma-4-E2B/config.json", "gemma_config.json")
+save_file("gemma-4-E2B/tokenizer_config.json", "gemma_tokenizer_config.json")
 
 print("\nDone! Check the data/0-sample/ folder for the output files.")

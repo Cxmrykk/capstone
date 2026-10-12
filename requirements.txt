@@ -10,10 +10,12 @@ tqdm
 
 # Training stack. On Colab, torch is already present -- pip will keep it.
 #
-# Note on dtype: a free-tier T4 is Turing (sm_75) and has NO bfloat16 support.
+# Note on dtype: the Colab T4 is Turing (sm_75) and has NO bfloat16 support.
 # The toolkit detects this and trains in fp16 automatically; do not force bf16.
 torch>=2.3.0
-transformers>=4.45.0
+# Gemma 4 and Qwen3.5 are recent architectures. The floor matches the
+# transformers_version recorded in the Gemma 4 model config.
+transformers>=5.5.0
 accelerate>=0.34.0
 peft>=0.13.0
 bitsandbytes>=0.43.0
@@ -21,8 +23,8 @@ sentencepiece
 protobuf
 safetensors
 
-# Optional, tried first by the model loader and skipped if it cannot load the
-# architecture. Install separately on Colab: pip install unsloth
+# Optional, used by the Qwen configs only (Gemma configs set use_unsloth: "no").
+# Installed by scripts/colab_bootstrap.sh.
 # unsloth
 
 # Optional experiment tracking (set train.report_to: ["wandb"] to enable)

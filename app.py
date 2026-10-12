@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Text2Cypher Toolkit: Fine-tuning and evaluating lightweight LLMs for graph databases.
+Text2Cypher Toolkit: Fine-tuning and evaluating lightweight (2B) LLMs for graph databases.
 
 Usage:
     python app.py doctor
     python app.py data stats
-    python app.py train --config configs/qwen3.5-2b.yaml
-    python app.py predict --config configs/qwen3.5-2b.yaml --adapter artifacts/runs/<run>/final
+    python app.py train --config configs/gemma-4-e2b.yaml
+    python app.py predict --config configs/gemma-4-e2b.yaml --adapter artifacts/runs/<run>/final
     python app.py evaluate --predictions artifacts/predictions/<file>.jsonl --execute
     python app.py export merge --config ... --adapter ...
     python app.py export gguf --merged artifacts/merged/<name> --quant Q4_K_M
     python app.py checkpoint list --config ...
+    python app.py checkpoint pull --config ... --step final
 """
 from __future__ import annotations
 
@@ -134,10 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--config", required=True)
     cl.add_argument("--run-name", default=None)
 
-    cp = c_sub.add_parser("pull", help="Download a checkpoint from the Hub.")
+    cp = c_sub.add_parser("pull", help="Download a checkpoint or the final adapter from the Hub.")
     cp.add_argument("--config", required=True)
     cp.add_argument("--run-name", default=None)
-    cp.add_argument("--step", default="latest")
+    cp.add_argument("--step", default="latest",
+                    help="'latest', a step number, or 'final' (completed adapter -> "
+                         "artifacts/runs/<run>/final).")
     cp.add_argument("--dest", default=None)
 
     cu = c_sub.add_parser("push", help="Upload a local checkpoint directory to the Hub.")
@@ -303,6 +306,8 @@ def cmd_checkpoint(args) -> int:
 
     cfg = load_config(args.config)
     run_name = getattr(args, "run_name", None) or cfg.run_name
+    if run_name != cfg.run_name:
+        cfg.run_name = run_name
     sync = HubCheckpointSync.from_config(cfg, run_name=run_name)
 
     if args.checkpoint_command == "list":
@@ -320,8 +325,19 @@ def cmd_checkpoint(args) -> int:
         return 0
 
     if args.checkpoint_command == "pull":
+        if args.step == "final":
+            dest = Path(args.dest) if args.dest else cfg.resolved_output_dir() / "final"
+            out = sync.pull_final(dest)
+            if out is None:
+                print(f"No final adapter found for run '{run_name}' in {sync.repo_id}.")
+                return 1
+            print(f"Final adapter downloaded to {out}")
+            return 0
         step = None if args.step == "latest" else int(args.step)
         dest = sync.pull(step=step, dest=args.dest)
+        if dest is None:
+            print(f"No checkpoint found for run '{run_name}' in {sync.repo_id}.")
+            return 1
         print(f"Checkpoint downloaded to {dest}")
         return 0
 
@@ -395,6 +411,8 @@ def main(argv=None) -> int:
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # Reduce allocator fragmentation on 16 GB GPUs (also set in the notebook).
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     handler = DISPATCH[args.command]
     try:

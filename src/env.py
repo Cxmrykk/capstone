@@ -1,8 +1,8 @@
 """Environment diagnostics and system compatibility checks for `app.py doctor`.
 
 Verifies GPU accelerator availability, VRAM allocation, precision capabilities
-(such as fp16 on Nvidia Turing vs bf16 on Ampere+), Python dependencies,
-and Neo4j connectivity.
+(fp16 on NVIDIA Turing T4 vs bf16 on Ampere+), Python dependencies, and Neo4j
+connectivity.
 """
 from __future__ import annotations
 
@@ -19,11 +19,12 @@ from src.paths import artifacts_dir, data_dir, dataset_dir, is_colab, repo_root
 
 _PACKAGES = [
     "torch", "transformers", "peft", "accelerate", "bitsandbytes", "datasets",
-    "huggingface_hub", "trl", "unsloth", "neo4j", "yaml", "pandas", "pyarrow",
+    "huggingface_hub", "unsloth", "neo4j", "yaml", "pandas", "pyarrow",
     "sentence_transformers", "requests",
 ]
 
-_MODEL_DIRS = ["gemma-4-E2B", "gemma-4-E4B", "Qwen3.5-2B", "Qwen3.5-4B"]
+# Only 2B-parameter models are supported on the 16 GB T4.
+_MODEL_DIRS = ["gemma-4-E2B", "Qwen3.5-2B"]
 
 
 def _package_versions() -> Dict[str, str]:
@@ -153,11 +154,12 @@ def environment_report(check_neo4j: bool = False) -> Dict[str, Any]:
         "dataset": _dataset_status(),
         "models": _model_status(),
         "binaries": _which_all([
-            "git", "cmake", "make", "nvidia-smi", "neo4j", "cypher-shell", "java",
+            "git", "cmake", "make", "nvidia-smi", "hf", "neo4j", "cypher-shell", "java",
             "llama-cli", "llama-server", "llama-quantize",
         ]),
         "neo4j_service": _neo4j_service_status(),
         "hf_token_present": bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")),
+        "hub_repo": os.environ.get("T2C_HUB_REPO"),
     }
 
     llama_cpp = os.environ.get("LLAMA_CPP_DIR")
@@ -183,17 +185,19 @@ def _warnings(r: Dict[str, Any]) -> List[str]:
     if not t["available"]:
         warns.append("PyTorch is not installed -- training and PyTorch inference are unavailable.")
     elif not t["cuda"]:
-        warns.append("No CUDA GPU detected. Model fine-tuning requires GPU acceleration.")
+        warns.append("No CUDA GPU detected. Model fine-tuning requires GPU acceleration "
+                     "(Colab: Runtime > Change runtime type > T4 GPU).")
     else:
         if not t["bf16_supported"]:
             warns.append(
                 f"{t['device_name']} (sm_{t['capability']}) does not support bfloat16. "
-                "The pipeline will use fp16 precision automatically."
+                "Training uses fp16 automatically; Gemma configs disable Unsloth because it "
+                "upcasts Gemma 4 to fp32 on this hardware. Expected on a T4."
             )
         if t["total_vram_gb"] and t["total_vram_gb"] < 20:
             warns.append(
-                f"Detected {t['total_vram_gb']} GB VRAM. Use 4-bit quantization, "
-                "gradient checkpointing, and appropriate micro-batch sizes."
+                f"Detected {t['total_vram_gb']} GB VRAM. Only the 2B configs are supported; "
+                "keep 4-bit loading, gradient checkpointing and target_only_loss enabled."
             )
 
     if r["packages"].get("bitsandbytes") == "MISSING" and t.get("cuda"):
@@ -205,10 +209,18 @@ def _warnings(r: Dict[str, Any]) -> List[str]:
 
     ds = r["dataset"]
     if not (ds["train_parquet"] and ds["test_parquet"]):
-        warns.append(f"Dataset Parquet files missing from {ds['dir']}. Run ./download_data.sh")
+        warns.append(f"Dataset Parquet files missing from {ds['dir']}. Run: bash download_data.sh")
+
+    missing_models = [n for n, st in r["models"].items() if not st["has_weights"]]
+    if missing_models:
+        warns.append("Base model weights not found locally for: " + ", ".join(missing_models)
+                     + " (download_data.sh, or they will be fetched from the Hub on first load).")
 
     if not r["hf_token_present"]:
         warns.append("HF_TOKEN is not set -- gated model access and remote checkpoint sync may fail.")
+    if not r.get("hub_repo"):
+        warns.append("T2C_HUB_REPO is not set and configs use hub.repo_id: null -- "
+                     "checkpoints will only be kept locally and are lost when Colab resets.")
 
     if not r["llama_cpp_dir"] and not r["binaries"].get("llama-cli"):
         warns.append("llama.cpp not found -- run scripts/build_llama_cpp.sh before GGUF export.")
@@ -228,6 +240,7 @@ def render_report(r: Dict[str, Any]) -> str:
     add(f"Environment     : {'Google Colab' if r['is_colab'] else 'Standalone / Local'}")
     add(f"Repository Root : {r['repo_root']}")
     add(f"Artifacts Dir   : {r['artifacts_dir']}")
+    add(f"Hub Repo        : {r.get('hub_repo') or '-'}")
     add("")
 
     t = r["torch"]
@@ -250,10 +263,10 @@ def render_report(r: Dict[str, Any]) -> str:
     add("-- Dataset Status -------------------------------------------------")
     ds = r["dataset"]
     add(f"  Location      : {ds['dir']}")
-    add(f"  Train Split   : {'Present' if ds['train_parquet'] else 'MISSING'} "
-        f"({ds['train_size_mb']} MB)" if ds["train_parquet"] else "  Train Split   : MISSING")
-    add(f"  Test Split    : {'Present' if ds['test_parquet'] else 'MISSING'} "
-        f"({ds['test_size_mb']} MB)" if ds["test_parquet"] else "  Test Split    : MISSING")
+    add(f"  Train Split   : Present ({ds['train_size_mb']} MB)" if ds["train_parquet"]
+        else "  Train Split   : MISSING")
+    add(f"  Test Split    : Present ({ds['test_size_mb']} MB)" if ds["test_parquet"]
+        else "  Test Split    : MISSING")
     add("")
 
     add("-- Local Base Models ----------------------------------------------")

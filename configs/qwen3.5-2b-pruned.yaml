@@ -1,4 +1,4 @@
-# Configuration: Qwen3.5-2B with dynamic exact-match schema pruning.
+# Qwen3.5-2B with dynamic exact-match schema pruning.
 # Prunes irrelevant node labels and properties based on question tokens to reduce prompt length.
 run_name: qwen3.5-2b-exact-match
 
@@ -7,6 +7,7 @@ model:
   load_in_4bit: true
   attn_implementation: auto
   use_unsloth: auto
+  upcast_frozen_params: false
 
 data:
   schema_mode: exact_match
@@ -46,6 +47,8 @@ train:
   dataloader_num_workers: 2
   seed: 3407
   time_limit_minutes: 210
+  target_only_loss: true
+  nan_guard_patience: 3
   report_to: []
 
 hub:

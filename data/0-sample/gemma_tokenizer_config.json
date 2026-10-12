@@ -1,4 +1,5 @@
 {
+    "add_bos_token": true,
     "audio_token": "<|audio|>",
     "backend": "tokenizers",
     "boa_token": "<|audio>",

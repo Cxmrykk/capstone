@@ -1,4 +1,4 @@
-"""Path resolution that behaves identically on local CPU and on Colab."""
+"""Path resolution that behaves identically on a local machine and on Colab."""
 from __future__ import annotations
 
 import os
@@ -25,9 +25,14 @@ def repo_root() -> Path:
 
 @lru_cache(maxsize=1)
 def is_colab() -> bool:
+    """True inside a Colab runtime, including `!python app.py ...` subprocesses.
+
+    Subprocesses never import google.colab, so the runtime's environment
+    variables are checked as well.
+    """
     if "google.colab" in sys.modules:
         return True
-    return Path("/content").is_dir() and Path("/usr/local/lib/python3*/dist-packages").parent.exists()
+    return bool(os.environ.get("COLAB_RELEASE_TAG") or os.environ.get("COLAB_GPU"))
 
 
 @lru_cache(maxsize=1)
@@ -43,14 +48,14 @@ def artifacts_dir() -> Path:
     """
     Scratch space for runs, predictions, reports and exports.
 
-    On Colab this defaults to local (fast, ephemeral) disk; durability comes
-    from the Hub checkpoint sync rather than from the filesystem.
+    Always <repo>/artifacts unless T2C_ARTIFACTS_DIR is set. On Colab the repo
+    lives on the VM's local disk (/content/capstone), so this is already fast,
+    and it keeps the relative `artifacts/...` paths used in the notebook valid.
+    Durability across Colab sessions comes from the Hub checkpoint sync.
     """
     env = os.environ.get("T2C_ARTIFACTS_DIR")
     if env:
         path = Path(env).expanduser().resolve()
-    elif is_colab():
-        path = Path("/content/artifacts")
     else:
         path = repo_root() / "artifacts"
     path.mkdir(parents=True, exist_ok=True)
