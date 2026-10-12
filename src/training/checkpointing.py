@@ -29,6 +29,12 @@ _IGNORE_PATTERNS = [
     "*.gguf",
     "global_step*/*",
     "*.pt.tmp",
+    # PEFT's auto-generated model card sets `base_model` to the local model path
+    # (e.g. /content/capstone/data/gemma-4-E2B). The Hub validates model-card
+    # metadata on every commit and rejects the whole upload ("Invalid metadata
+    # in README.md"). The card is not needed to resume, predict or merge.
+    "README.md",
+    "*/README.md",
 ]
 
 
@@ -55,6 +61,10 @@ class HubCheckpointSync:
     _thread: Optional[threading.Thread] = None
     _lock: Optional[threading.Lock] = None
     _repo_ready: bool = False
+    # Set when the most recent checkpoint or final upload failed; cleared by the
+    # next successful upload. Checked by the trainer so a failed upload is never
+    # silent (a silent failure means the next Colab session restarts from scratch).
+    last_upload_error: Optional[str] = None
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
@@ -176,10 +186,12 @@ class HubCheckpointSync:
                     commit_message=f"[{self.run_name}] mark checkpoint-{step} as latest",
                 )
 
+                self.last_upload_error = None
                 log.info("Uploaded checkpoint-%d in %.1fs.", step, time.time() - start)
                 self.prune(keep_last=self.keep_last, protect_step=step)
 
             except Exception as exc:
+                self.last_upload_error = f"checkpoint-{step}: {exc}"
                 log.error("Checkpoint upload failed for step %d: %s", step, exc)
 
     def _mirror_to_drive(self, local_dir: Path, step: int) -> None:
@@ -331,10 +343,13 @@ class HubCheckpointSync:
             except Exception as exc:
                 log.warning("Could not prune checkpoint-%d: %s", step, exc)
 
-    def push_final(self, local_dir: str | Path, metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Uploads the completed adapter and run metadata to runs/<run_name>/final."""
+    def push_final(self, local_dir: str | Path, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Uploads the completed adapter and run metadata to runs/<run_name>/final.
+
+        Returns True on success. On failure, last_upload_error is set.
+        """
         if not self.enabled:
-            return
+            return False
         self.ensure_repo()
         try:
             api = self._api()
@@ -354,9 +369,13 @@ class HubCheckpointSync:
                     repo_type="model",
                     commit_message=f"[{self.run_name}] run metadata",
                 )
+            self.last_upload_error = None
             log.info("Final adapter successfully uploaded to %s/%s/final", self.repo_id, self.run_prefix)
+            return True
         except Exception as exc:
+            self.last_upload_error = f"final: {exc}"
             log.error("Failed to upload final adapter: %s", exc)
+            return False
 
 
 # --------------------------------------------------------------------------- #
@@ -376,6 +395,14 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
         def on_save(self, args, state, control, **kwargs):
             if sync is None or not sync.enabled or not state.is_world_process_zero:
                 return control
+            # Uploads run in the background, so a failure from the previous save
+            # is only visible now. Repeat it at every save so it cannot scroll by.
+            if sync.last_upload_error:
+                log.error(
+                    "Previous checkpoint upload FAILED (%s). Until an upload succeeds, "
+                    "progress will NOT survive the end of this Colab session.",
+                    sync.last_upload_error,
+                )
             ckpt_dir = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
             sync.push(
                 ckpt_dir,

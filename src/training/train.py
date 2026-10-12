@@ -97,6 +97,20 @@ def _logits_to_keep_kwarg(params: Set[str]) -> Optional[str]:
     return None
 
 
+def _report_upload_failure(sync: Optional[HubCheckpointSync], context: str) -> bool:
+    """Logs a prominent error if the most recent Hub upload failed. Returns True if it did."""
+    if sync is None or not sync.last_upload_error:
+        return False
+    log.error("=" * 66)
+    log.error("HUB UPLOAD FAILED (%s): %s", context, sync.last_upload_error)
+    log.error("Nothing from this session is safely on the Hub. If the Colab runtime is")
+    log.error("reset, the next session will NOT resume from this point. Fix the upload")
+    log.error("error, then push the local checkpoint manually before the runtime ends:")
+    log.error("  python app.py checkpoint push --config <cfg> --path <output_dir>/checkpoint-<step>")
+    log.error("=" * 66)
+    return True
+
+
 @dataclass
 class TokenTypeIdsCollator:
     """Adds an all-zero (text-only) token_type_ids tensor for models that expect it.
@@ -335,8 +349,10 @@ def run_training(cfg: RunConfig, resume: str = "auto") -> Path:
         log.warning("Training interrupted by user. Saving emergency checkpoint.")
         trainer.save_model(str(output_dir / "interrupted"))
         if sync is not None:
+            sync.wait()
             sync.push(output_dir / "interrupted",
                       step=int(trainer.state.global_step), blocking=True)
+            _report_upload_failure(sync, "emergency checkpoint")
         raise
     except oom_types:
         log.error(
@@ -346,6 +362,9 @@ def run_training(cfg: RunConfig, resume: str = "auto") -> Path:
             "checkpoint is preserved -- rerun with --resume auto after changing a non-fingerprinted "
             "setting, or under a new --run-name otherwise."
         )
+        if sync is not None:
+            sync.wait()
+            _report_upload_failure(sync, "last checkpoint before OOM")
         raise
 
     guard = next((cb for cb in callbacks if getattr(cb, "is_nonfinite_guard", False)), None)
@@ -357,6 +376,7 @@ def run_training(cfg: RunConfig, resume: str = "auto") -> Path:
         )
         if sync is not None:
             sync.wait()
+            _report_upload_failure(sync, "last checkpoint before non-finite loss")
         raise SystemExit(EXIT_NONFINITE_LOSS)
 
     # A wall-clock stop (Colab session budget) returns from trainer.train()
@@ -366,13 +386,20 @@ def run_training(cfg: RunConfig, resume: str = "auto") -> Path:
     # to resume.
     state = trainer.state
     if state.max_steps and state.global_step < state.max_steps:
+        upload_failed = False
         if sync is not None:
             sync.wait()
+            upload_failed = _report_upload_failure(sync, "time-limit checkpoint")
+        if sync is None:
+            where = "locally only"
+        elif upload_failed:
+            where = "locally only (Hub upload FAILED, see above)"
+        else:
+            where = "and synced to the Hub"
         log.warning(
             "Training paused at step %d/%d (time limit reached). The checkpoint was saved %s. "
             "Rerun with --resume auto to continue. No final adapter was written.",
-            state.global_step, state.max_steps,
-            "and synced to the Hub" if sync is not None else "locally only",
+            state.global_step, state.max_steps, where,
         )
         raise SystemExit(EXIT_TIME_LIMIT)
 
@@ -410,7 +437,10 @@ def run_training(cfg: RunConfig, resume: str = "auto") -> Path:
 
     if sync is not None:
         sync.wait()
-        sync.push_final(final_dir, metadata)
+        if not sync.push_final(final_dir, metadata):
+            _report_upload_failure(sync, "final adapter")
+            log.error("The final adapter exists locally at %s and can be used in this session, "
+                      "but a fresh session will retrain unless it is uploaded.", final_dir)
 
     log.info("=" * 66)
     log.info("Training completed in %.1f min at step %d.",
