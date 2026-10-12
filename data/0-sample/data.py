@@ -46,10 +46,13 @@ def save_file(rel_in_path, out_filename, is_json=True):
     else:
         print(f"❌ Missing: {rel_in_path}")
 
-# --- 2. Save Model Configs (2B models only; 4B models are out of scope on a T4) ---
+# --- 2. Save Model Configs (2B models + Granite 3B control; 4B models are out of scope on a T4) ---
 save_file("Qwen3.5-2B/config.json", "qwen_config.json")
 save_file("Qwen3.5-2B/chat_template.jinja", "qwen_chat_template.jinja", is_json=False)
 save_file("gemma-4-E2B/config.json", "gemma_config.json")
 save_file("gemma-4-E2B/tokenizer_config.json", "gemma_tokenizer_config.json")
+save_file("granite-4.2-3b/config.json", "granite_config.json")
+save_file("granite-4.2-3b/tokenizer_config.json", "granite_tokenizer_config.json")
+save_file("granite-4.2-3b/chat_template.jinja", "granite_chat_template.jinja", is_json=False)
 
 print("\nDone! Check the data/0-sample/ folder for the output files.")

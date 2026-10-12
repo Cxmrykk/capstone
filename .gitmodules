@@ -10,3 +10,7 @@
 	path = data/Qwen3.5-2B
 	url = https://huggingface.co/Qwen/Qwen3.5-2B
 	ignore = dirty
+[submodule "data/granite-4.2-3b"]
+	path = data/granite-4.2-3b
+	url = https://huggingface.co/ibm-granite/granite-4.2-3b
+	ignore = dirty

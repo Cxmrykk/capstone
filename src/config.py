@@ -3,8 +3,9 @@
 Encapsulates all runtime, training, data processing, generation, and evaluation
 parameters to ensure reproducible runs via YAML files and CLI overrides.
 
-Only 2B-parameter models are registered: the project targets a single 16 GB
-NVIDIA T4 (Google Colab free tier), on which the 4B variants do not fit.
+The project targets a single 16 GB NVIDIA T4 (Google Colab free tier). The two
+2B-parameter models under study are registered, plus Granite 4.2 3B as a
+conventional dense-transformer control. The 4B variants do not fit a T4.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ class ModelSpec:
     key: str
     hf_id: str
     local_dirname: str
-    family: str                      # "gemma" | "qwen" | "generic"
+    family: str                      # "gemma" | "qwen" | "granite" | "generic"
     attn_implementation: str = "sdpa"
     # Arguments passed to tokenizer.apply_chat_template(). For instance, disabling
     # reasoning traces prevents unwanted prefix tokens during instruction tuning.
@@ -83,6 +84,21 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         supports_system_role=True,
         notes="Hybrid linear/full attention model with standard chat template support.",
     ),
+    "granite-4.2-3b": ModelSpec(
+        key="granite-4.2-3b",
+        hf_id="ibm-granite/granite-4.2-3b",
+        local_dirname="granite-4.2-3b",
+        family="granite",
+        attn_implementation="sdpa",
+        # The repository ships a reasoning parser, so the template may expose a
+        # thinking switch. Both common variable names are set to False; unused
+        # Jinja variables are ignored, and render_prompt drops enable_thinking
+        # when the template does not reference it.
+        chat_template_kwargs={"thinking": False, "enable_thinking": False},
+        supports_system_role=True,
+        notes="Text-only control model used to separate model-family effects "
+              "from the unusual Gemma 4 / Qwen3.5 architectures.",
+    ),
 }
 
 # CLI aliases for model keys
@@ -92,6 +108,9 @@ MODEL_ALIASES = {
     "gemma-e2b": "gemma-4-e2b",
     "qwen-2b": "qwen3.5-2b",
     "qwen2b": "qwen3.5-2b",
+    "granite": "granite-4.2-3b",
+    "granite-3b": "granite-4.2-3b",
+    "granite3b": "granite-4.2-3b",
 }
 
 
@@ -223,7 +242,9 @@ class GenerationConfig:
     batch_size: int = 8
     do_sample: bool = False
     repetition_penalty: float = 1.0
-    stop_strings: List[str] = field(default_factory=lambda: ["\n\n\n", "<|im_end|>", "<end_of_turn>"])
+    stop_strings: List[str] = field(default_factory=lambda: [
+        "\n\n\n", "<|im_end|>", "<end_of_turn>", "<|end_of_text|>",
+    ])
 
 
 @dataclass

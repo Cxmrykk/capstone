@@ -23,8 +23,9 @@ _PACKAGES = [
     "sentence_transformers", "requests",
 ]
 
-# Only 2B-parameter models are supported on the 16 GB T4.
-_MODEL_DIRS = ["gemma-4-E2B", "Qwen3.5-2B"]
+# Models supported on the 16 GB T4: the two 2B models under study plus the
+# Granite 4.2 3B dense-transformer control.
+_MODEL_DIRS = ["gemma-4-E2B", "Qwen3.5-2B", "granite-4.2-3b"]
 
 
 def _package_versions() -> Dict[str, str]:
@@ -196,8 +197,9 @@ def _warnings(r: Dict[str, Any]) -> List[str]:
             )
         if t["total_vram_gb"] and t["total_vram_gb"] < 20:
             warns.append(
-                f"Detected {t['total_vram_gb']} GB VRAM. Only the 2B configs are supported; "
-                "keep 4-bit loading, gradient checkpointing and target_only_loss enabled."
+                f"Detected {t['total_vram_gb']} GB VRAM. Only the 2B configs and the Granite 3B "
+                "control config are supported; keep 4-bit loading, gradient checkpointing and "
+                "target_only_loss enabled."
             )
 
     if r["packages"].get("bitsandbytes") == "MISSING" and t.get("cuda"):
