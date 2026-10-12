@@ -6,7 +6,6 @@ memory-lean k-bit preparation for 16 GB GPUs, and optional Unsloth acceleration.
 """
 from __future__ import annotations
 
-import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import RunConfig
@@ -18,19 +17,33 @@ log = get_logger(__name__)
 # --------------------------------------------------------------------------- #
 # Precision & Compute Dtype Selection
 # --------------------------------------------------------------------------- #
+def native_bf16_supported() -> bool:
+    """True only when the GPU executes bfloat16 natively (compute capability >= 8.0).
+
+    torch.cuda.is_bf16_supported() also returns True when bf16 can merely be
+    emulated, which recent PyTorch builds report for Turing (T4, sm_75). Training
+    in emulated bf16 is very slow and unsupported by mixed-precision kernels, so
+    the capability is checked directly.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability(0)
+    except Exception:
+        return False
+    return major >= 8
+
+
 def select_dtype():
     """Selects the optimal torch compute dtype based on hardware capabilities."""
     import torch
 
     if not torch.cuda.is_available():
         return torch.float32
-    try:
-        if torch.cuda.is_bf16_supported():
-            return torch.bfloat16
-    except Exception:
-        props = torch.cuda.get_device_properties(0)
-        if props.major >= 8:
-            return torch.bfloat16
+    if native_bf16_supported():
+        return torch.bfloat16
     return torch.float16
 
 
@@ -46,10 +59,17 @@ def dtype_flags() -> Dict[str, bool]:
 
 
 def _dtype_kwarg(dtype) -> Dict[str, Any]:
+    """Returns the from_pretrained dtype keyword for the installed transformers.
+
+    transformers >= 4.56 accepts `dtype` (and v5 deprecates `torch_dtype`). Its
+    from_pretrained signature only exposes **kwargs, so the version is checked
+    rather than the signature.
+    """
     try:
-        from transformers import AutoModelForCausalLM
-        params = inspect.signature(AutoModelForCausalLM.from_pretrained).parameters
-        if "dtype" in params and "torch_dtype" not in params:
+        import transformers
+        from packaging.version import Version
+
+        if Version(transformers.__version__) >= Version("4.56.0"):
             return {"dtype": dtype}
     except Exception:
         pass
@@ -94,18 +114,22 @@ def load_tokenizer(cfg: RunConfig, padding_side: str = "right"):
 # --------------------------------------------------------------------------- #
 # LoRA Target Module Resolution
 # --------------------------------------------------------------------------- #
-def discover_lora_targets(model, exclude_substrings: List[str]) -> List[str]:
-    """Discovers recurring linear module layer names for LoRA adaptation."""
+def _linear_types() -> Tuple[type, ...]:
     import torch.nn as nn
 
-    linear_types: Tuple[type, ...] = (nn.Linear,)
+    types: Tuple[type, ...] = (nn.Linear,)
     try:
         import bitsandbytes as bnb
-        linear_types = linear_types + (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt)
+        types = types + (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt)
     except Exception:
         pass
+    return types
 
-    names: Dict[str, int] = {}
+
+def _scan_linear_modules(model, exclude_substrings: List[str]) -> List[str]:
+    """Returns full paths of eligible linear modules, outside excluded subtrees."""
+    linear_types = _linear_types()
+    paths: List[str] = []
     for full_name, module in model.named_modules():
         if not isinstance(module, linear_types):
             continue
@@ -115,29 +139,65 @@ def discover_lora_targets(model, exclude_substrings: List[str]) -> List[str]:
         leaf = full_name.split(".")[-1]
         if leaf in {"lm_head", "score", "classifier"}:
             continue
-        names[leaf] = names.get(leaf, 0) + 1
+        paths.append(full_name)
+    return paths
 
-    if not names:
+
+def discover_lora_targets(model, exclude_substrings: List[str]) -> List[str]:
+    """Discovers recurring linear projection leaf names (e.g. q_proj) for LoRA."""
+    counts: Dict[str, int] = {}
+    for path in _scan_linear_modules(model, exclude_substrings):
+        leaf = path.split(".")[-1]
+        counts[leaf] = counts.get(leaf, 0) + 1
+
+    if not counts:
         raise RuntimeError(
             "No eligible linear projection modules found for LoRA. "
             "Inspect the architecture tree and specify lora.target_modules explicitly."
         )
 
     # Filter out single-instance projection layers; keep recurring transformer projections
-    repeated = [n for n, c in names.items() if c >= 2] or list(names)
-    ordered = sorted(repeated, key=lambda n: (-names[n], n))
+    repeated = [n for n, c in counts.items() if c >= 2] or list(counts)
+    ordered = sorted(repeated, key=lambda n: (-counts[n], n))
     log.info("Identified %d LoRA target projection layers: %s",
              len(ordered), ", ".join(ordered))
     return ordered
 
 
-def resolve_target_modules(model, cfg: RunConfig):
+def discover_lora_target_paths(model, exclude_substrings: List[str]) -> List[str]:
+    """Returns the exact module paths to adapt.
+
+    PEFT matches leaf names (e.g. "q_proj") anywhere in the model, including
+    subtrees excluded above. Gemma 4's vision/audio towers contain q_proj etc.
+    as Gemma4ClippableLinear wrappers, which PEFT rejects. Full paths keep the
+    adapter on exactly the modules found here.
+    """
+    leaves = set(discover_lora_targets(model, exclude_substrings))
+    paths = [p for p in _scan_linear_modules(model, exclude_substrings)
+             if p.split(".")[-1] in leaves]
+    log.info("LoRA will adapt %d modules (exact paths; excluded: %s).",
+             len(paths), ", ".join(exclude_substrings))
+    return paths
+
+
+def resolve_target_modules(model, cfg: RunConfig, full_paths: bool = True):
     tm = cfg.lora.target_modules
     if isinstance(tm, list):
         return tm
     if tm == "all-linear":
         return "all-linear"
-    return discover_lora_targets(model, cfg.model.spec.lora_exclude_substrings)
+    excludes = cfg.model.spec.lora_exclude_substrings
+    if full_paths:
+        return discover_lora_target_paths(model, excludes)
+    return discover_lora_targets(model, excludes)
+
+
+def _summarise_targets(targets) -> Any:
+    """Compact description of target modules for logs and run metadata."""
+    if not isinstance(targets, list):
+        return targets
+    leaves = sorted({t.split(".")[-1] for t in targets})
+    return {"n_modules": len(targets), "leaf_names": leaves}
 
 
 # --------------------------------------------------------------------------- #
@@ -313,7 +373,8 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
         meta["unsloth"] = True
         from unsloth import FastLanguageModel
 
-        targets = resolve_target_modules(model, cfg)
+        # Unsloth expects leaf names; it applies its own module filtering.
+        targets = resolve_target_modules(model, cfg, full_paths=False)
         if targets == "all-linear":
             targets = discover_lora_targets(model, cfg.model.spec.lora_exclude_substrings)
         model = FastLanguageModel.get_peft_model(
@@ -326,7 +387,7 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
             use_gradient_checkpointing="unsloth" if cfg.train.gradient_checkpointing else False,
             random_state=cfg.train.seed,
         )
-        meta["target_modules"] = targets
+        meta["target_modules"] = _summarise_targets(targets)
         _finalise(model, tokenizer, cfg, for_training)
         return model, tokenizer, meta
 
@@ -362,7 +423,7 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
 
-        targets = resolve_target_modules(model, cfg)
+        targets = resolve_target_modules(model, cfg, full_paths=True)
         peft_cfg = LoraConfig(
             r=cfg.lora.r,
             lora_alpha=cfg.lora.alpha,
@@ -374,7 +435,7 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
         )
         model = get_peft_model(model, peft_cfg)
         _upcast_trainable_to_fp32(model)
-        meta["target_modules"] = targets
+        meta["target_modules"] = _summarise_targets(targets)
         try:
             model.print_trainable_parameters()
         except Exception:

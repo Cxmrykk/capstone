@@ -83,11 +83,14 @@ def _torch_info() -> Dict[str, Any]:
     info["capability"] = f"{props.major}.{props.minor}"
     info["total_vram_gb"] = round(props.total_memory / (1024 ** 3), 2)
 
-    try:
-        bf16 = bool(torch.cuda.is_bf16_supported())
-    except Exception:
-        bf16 = props.major >= 8
+    # Native bf16 needs Ampere (sm_80) or newer. torch.cuda.is_bf16_supported()
+    # also reports emulated bf16, which recent PyTorch claims for the T4.
+    bf16 = props.major >= 8
     info["bf16_supported"] = bf16
+    try:
+        info["bf16_emulated"] = (not bf16) and bool(torch.cuda.is_bf16_supported())
+    except Exception:
+        info["bf16_emulated"] = False
     info["recommended_dtype"] = "bfloat16" if bf16 else "float16"
     return info
 
@@ -206,8 +209,9 @@ def _warnings(r: Dict[str, Any]) -> List[str]:
                      "(Colab: Runtime > Change runtime type > T4 GPU).")
     else:
         if not t["bf16_supported"]:
+            emulated = " (PyTorch reports emulated bf16 only)" if t.get("bf16_emulated") else ""
             warns.append(
-                f"{t['device_name']} (sm_{t['capability']}) does not support bfloat16. "
+                f"{t['device_name']} (sm_{t['capability']}) has no native bfloat16{emulated}. "
                 "Training uses fp16 automatically; the Gemma and Granite configs disable Unsloth "
                 "(it upcasts Gemma 4 to fp32 on this hardware). Expected on a T4."
             )
@@ -264,10 +268,16 @@ def render_report(r: Dict[str, Any]) -> str:
     t = r["torch"]
     add("-- Accelerator ----------------------------------------------------")
     if t["cuda"]:
+        if t["bf16_supported"]:
+            bf16_text = "Supported (native)"
+        elif t.get("bf16_emulated"):
+            bf16_text = "Emulated only (not used)"
+        else:
+            bf16_text = "Not Supported"
         add(f"Device          : {t['device_name']} (sm_{t['capability']})")
         add(f"VRAM            : {t['total_vram_gb']} GB")
         add(f"CUDA Version    : {t.get('cuda_version')}")
-        add(f"bfloat16        : {'Supported' if t['bf16_supported'] else 'Not Supported'}")
+        add(f"bfloat16        : {bf16_text}")
         add(f"Training Dtype  : {t['recommended_dtype']}")
     else:
         add("Device          : CPU only")
