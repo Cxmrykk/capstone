@@ -2,10 +2,14 @@
 
 Handles device-aware precision selection (fp16 on NVIDIA Turing T4, bf16 on
 Ampere+), automatic discovery of linear projection layers for LoRA injection,
-memory-lean k-bit preparation for 16 GB GPUs, and optional Unsloth acceleration.
+memory-lean k-bit preparation for 16 GB GPUs, optional Unsloth acceleration,
+and verified adapter loading that survives a change of wrapper class between
+training and inference (history/027.md).
 """
 from __future__ import annotations
 
+import warnings
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import RunConfig
@@ -201,6 +205,131 @@ def _summarise_targets(targets) -> Any:
 
 
 # --------------------------------------------------------------------------- #
+# Verified Adapter Loading
+# --------------------------------------------------------------------------- #
+def _read_adapter_state_dict(adapter_path: str | Path) -> Dict[str, Any]:
+    """Reads the saved LoRA tensors (safetensors preferred, .bin fallback)."""
+    adapter_path = Path(adapter_path)
+    st = adapter_path / "adapter_model.safetensors"
+    if st.exists():
+        from safetensors.torch import load_file
+
+        return load_file(str(st))
+    binary = adapter_path / "adapter_model.bin"
+    if binary.exists():
+        import torch
+
+        return torch.load(str(binary), map_location="cpu", weights_only=True)
+    raise FileNotFoundError(f"No adapter_model.safetensors or adapter_model.bin in {adapter_path}")
+
+
+def _normalise_adapter_key(key: str) -> str:
+    """Drops the multimodal wrapper segment so text-only and wrapped paths compare equal.
+
+    Qwen3.5 trained through Unsloth is a Qwen3_5ForConditionalGeneration
+    (model.language_model.layers.N...), while AutoModelForCausalLM loads the
+    text-only Qwen3_5ForCausalLM (model.layers.N...). The layers are identical.
+    """
+    return key.replace("language_model.", "")
+
+
+def _load_adapter_weights_verified(model, adapter_path: str | Path) -> None:
+    """Loads the saved LoRA tensors into `model`, remapping wrapper prefixes, and verifies.
+
+    Raises instead of warning: a silently unloaded adapter evaluates the base
+    model while reporting it as fine-tuned (history/027.md).
+    """
+    from peft import get_peft_model_state_dict, set_peft_model_state_dict
+
+    file_sd = _read_adapter_state_dict(adapter_path)
+    expected = list(get_peft_model_state_dict(model).keys())
+    expected_set = set(expected)
+
+    by_norm: Dict[str, str] = {}
+    ambiguous = set()
+    for key in expected:
+        norm = _normalise_adapter_key(key)
+        if norm in by_norm:
+            ambiguous.add(norm)
+        by_norm[norm] = key
+
+    remapped: Dict[str, Any] = {}
+    unmatched: List[str] = []
+    n_renamed = 0
+    rename_example: Optional[Tuple[str, str]] = None
+    for key, tensor in file_sd.items():
+        if key in expected_set:
+            remapped[key] = tensor
+            continue
+        norm = _normalise_adapter_key(key)
+        target = None if norm in ambiguous else by_norm.get(norm)
+        if target is None or target in remapped:
+            unmatched.append(key)
+            continue
+        remapped[target] = tensor
+        n_renamed += 1
+        if rename_example is None:
+            rename_example = (key, target)
+
+    missing = sorted(expected_set - set(remapped))
+    if unmatched or missing:
+        raise RuntimeError(
+            f"Adapter at {adapter_path} does not fit the loaded model "
+            f"({len(file_sd)} saved tensors, {len(expected)} expected; "
+            f"{len(unmatched)} unmatched, {len(missing)} missing).\n"
+            f"  unmatched (saved): {unmatched[:3]}\n"
+            f"  missing (model)  : {missing[:3]}\n"
+            "The base model class or module layout differs from training."
+        )
+
+    if n_renamed:
+        log.info("Remapped %d adapter tensor names to the loaded model class "
+                 "(e.g. %s -> %s).", n_renamed, rename_example[0], rename_example[1])
+
+    result = set_peft_model_state_dict(model, remapped)
+    unexpected = list(getattr(result, "unexpected_keys", []) or [])
+    if unexpected:
+        raise RuntimeError(f"Adapter load reported unexpected keys: {unexpected[:3]}")
+
+    lora_b = [p for n, p in model.named_parameters() if "lora_B" in n]
+    nonzero = sum(1 for p in lora_b if float(p.detach().float().abs().sum()) > 0)
+    if lora_b and nonzero == 0:
+        raise RuntimeError(
+            f"All {len(lora_b)} lora_B tensors are zero after loading {adapter_path}; "
+            "the adapter would have no effect."
+        )
+    log.info("Adapter verified: %d tensors loaded, %d/%d lora_B non-zero.",
+             len(remapped), nonzero, len(lora_b))
+
+
+def attach_adapter(model, adapter_path: str | Path, is_trainable: bool = False, **kwargs):
+    """Wraps `model` with a saved LoRA adapter and verifies the weights actually loaded.
+
+    PEFT injects LoRA layers from adapter_config.json's target_modules, then
+    loads tensors by exact name and only *warns* about missing keys. When the
+    base model class differs from training (e.g. Unsloth's multimodal wrapper vs
+    the text-only CausalLM class), the layers are injected but stay at their
+    zero-initialised lora_B, so the adapter is a no-op. The tensors are therefore
+    reloaded here with prefix remapping and strict checks.
+    """
+    from peft import PeftModel
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        peft_model = PeftModel.from_pretrained(
+            model, str(adapter_path), is_trainable=is_trainable, **kwargs
+        )
+    for w in caught:
+        if "missing adapter keys" in str(w.message).lower():
+            log.debug("PEFT reported missing adapter keys; handled by remapped load.")
+        else:
+            warnings.showwarning(w.message, w.category, w.filename, w.lineno)
+
+    _load_adapter_weights_verified(peft_model, adapter_path)
+    return peft_model
+
+
+# --------------------------------------------------------------------------- #
 # k-bit Preparation
 # --------------------------------------------------------------------------- #
 def _prepare_kbit_lean(model, gradient_checkpointing: bool) -> None:
@@ -305,6 +434,7 @@ def _load_base_model(cfg: RunConfig, quantize: bool, dtype, for_training: bool):
             log.info("Loading %s with %s (attn=%s, 4bit=%s, dtype=%s)",
                      path, class_name, kwargs["attn_implementation"], quantize, dtype)
             model = cls.from_pretrained(path, **kwargs)
+            log.info("Loaded model class: %s", type(model).__name__)
             return model
         except Exception as exc:
             last_error = exc
@@ -342,7 +472,7 @@ def _try_unsloth(cfg: RunConfig, for_training: bool):
             load_in_4bit=cfg.model.load_in_4bit,
             trust_remote_code=cfg.model.trust_remote_code,
         )
-        log.info("Loaded model via Unsloth acceleration engine.")
+        log.info("Loaded model via Unsloth acceleration engine (%s).", type(model).__name__)
         return model, tokenizer
     except Exception as exc:
         if cfg.model.use_unsloth == "yes":
@@ -396,10 +526,8 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
                              for_training=for_training)
 
     if adapter_path:
-        from peft import PeftModel
-
         log.info("Loading LoRA adapter weights from %s", adapter_path)
-        model = PeftModel.from_pretrained(model, adapter_path, is_trainable=for_training)
+        model = attach_adapter(model, adapter_path, is_trainable=for_training)
         meta["adapter"] = adapter_path
         if for_training:
             _upcast_trainable_to_fp32(model)

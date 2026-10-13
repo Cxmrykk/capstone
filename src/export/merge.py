@@ -1,8 +1,9 @@
 """LoRA adapter merging into unquantized base model weights.
 
 Loads the unquantized base model in full or half precision (fp16/bf16),
-applies the trained PEFT adapter weights, merges them in-place, and exports
-a standalone Hugging Face model directory ready for inference or GGUF conversion.
+applies the trained PEFT adapter weights (verified, with wrapper-prefix
+remapping; history/027.md), merges them in-place, and exports a standalone
+Hugging Face model directory ready for inference or GGUF conversion.
 """
 from __future__ import annotations
 
@@ -24,9 +25,8 @@ def merge_adapter(cfg: RunConfig, adapter_path: str, out_dir: Optional[str] = No
                   dtype: str = "float16") -> Path:
     """Merges a LoRA adapter into full-precision base weights."""
     import torch
-    from peft import PeftModel
 
-    from src.training.model_loader import _dtype_kwarg, _load_base_model, load_tokenizer
+    from src.training.model_loader import _load_base_model, attach_adapter, load_tokenizer
 
     adapter = Path(adapter_path)
     if not adapter.exists():
@@ -45,7 +45,7 @@ def merge_adapter(cfg: RunConfig, adapter_path: str, out_dir: Optional[str] = No
         cfg.model.load_in_4bit = original_4bit
 
     log.info("Attaching LoRA adapter from %s ...", adapter)
-    model = PeftModel.from_pretrained(model, str(adapter), torch_dtype=torch_dtype)
+    model = attach_adapter(model, str(adapter), is_trainable=False, torch_dtype=torch_dtype)
 
     log.info("Merging adapter weights into base model layers...")
     model = model.merge_and_unload()
@@ -69,6 +69,7 @@ def merge_adapter(cfg: RunConfig, adapter_path: str, out_dir: Optional[str] = No
     metadata = {
         "base_model": cfg.model.resolved_path(),
         "model_key": cfg.model.key,
+        "model_class": type(model).__name__,
         "adapter": str(adapter),
         "dtype": dtype,
         "run_name": cfg.run_name,
