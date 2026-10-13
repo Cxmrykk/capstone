@@ -1,8 +1,13 @@
 """Remote checkpoint synchronization and state recovery for ephemeral environments.
 
 Ensures training state continuity on preemptible GPU instances (Google Colab
-free sessions) by synchronizing LoRA weights and optimizer states to a private
-Hugging Face Model Hub repository.
+and Kaggle free sessions) by synchronizing LoRA weights and optimizer states to
+a private Hugging Face Model Hub repository.
+
+Only *resumable* checkpoints (folders containing trainer_state.json, written by
+Trainer._save_checkpoint) are ever marked as LATEST or chosen for resume. An
+adapter-only folder (from Trainer.save_model) cannot be resumed by
+Trainer.train(resume_from_checkpoint=...), see history/026.md.
 """
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.config import RunConfig
 from src.logging_utils import get_logger
@@ -24,6 +29,10 @@ from src.paths import artifacts_dir, ensure_dir
 log = get_logger(__name__)
 
 _CHECKPOINT_RE = re.compile(r"checkpoint-(\d+)")
+# Matches "checkpoint-<step>/<file>" relative to runs/<run_name>/ on the Hub.
+_REMOTE_CKPT_FILE_RE = re.compile(r"^checkpoint-(\d+)/(.+)$")
+
+TRAINER_STATE_FILE = "trainer_state.json"
 
 _IGNORE_PATTERNS = [
     "*.gguf",
@@ -46,6 +55,23 @@ def _hf_token(cfg_env: str = "HF_TOKEN") -> Optional[str]:
     )
 
 
+def is_resumable_checkpoint(path: Optional[str | Path]) -> bool:
+    """True when `path` is a full Trainer checkpoint that resume_from_checkpoint accepts."""
+    if path is None:
+        return False
+    return (Path(path) / TRAINER_STATE_FILE).is_file()
+
+
+def checkpoint_metadata(cfg: RunConfig, fingerprint: str, state) -> Dict[str, Any]:
+    """Extra fields written into LATEST.json alongside a checkpoint upload."""
+    return {
+        "config_fingerprint": fingerprint,
+        "epoch": getattr(state, "epoch", None),
+        "model_key": cfg.model.key,
+        "schema_mode": cfg.data.schema_mode,
+    }
+
+
 @dataclass
 class HubCheckpointSync:
     """Manages background synchronization of adapter checkpoints to the Hugging Face Hub."""
@@ -63,7 +89,7 @@ class HubCheckpointSync:
     _repo_ready: bool = False
     # Set when the most recent checkpoint or final upload failed; cleared by the
     # next successful upload. Checked by the trainer so a failed upload is never
-    # silent (a silent failure means the next Colab session restarts from scratch).
+    # silent (a silent failure means the next session restarts from scratch).
     last_upload_error: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -121,6 +147,9 @@ class HubCheckpointSync:
         log.info("Remote checkpoint repository verified: %s (private=%s, run=%s)",
                  self.repo_id, self.private, self.run_name)
 
+    # ------------------------------------------------------------------- #
+    # Upload
+    # ------------------------------------------------------------------- #
     def push(self, local_dir: str | Path, step: int, blocking: bool = False,
              extra_metadata: Optional[Dict[str, Any]] = None) -> None:
         """Pushes a saved checkpoint directory to the Hub repository."""
@@ -157,8 +186,9 @@ class HubCheckpointSync:
             try:
                 api = self._api()
                 size_mb = sum(f.stat().st_size for f in local_dir.rglob("*") if f.is_file()) / 1e6
-                log.info("Uploading checkpoint-%d (%.1f MB) to %s ...",
-                         step, size_mb, self.repo_id)
+                resumable = is_resumable_checkpoint(local_dir)
+                log.info("Uploading checkpoint-%d (%.1f MB%s) to %s ...",
+                         step, size_mb, "" if resumable else ", NOT resumable", self.repo_id)
 
                 api.upload_folder(
                     folder_path=str(local_dir),
@@ -168,6 +198,15 @@ class HubCheckpointSync:
                     ignore_patterns=_IGNORE_PATTERNS,
                     commit_message=f"[{self.run_name}] checkpoint-{step}",
                 )
+
+                if not resumable:
+                    # Never point LATEST at a folder Trainer cannot resume from.
+                    self.last_upload_error = None
+                    log.warning(
+                        "checkpoint-%d has no %s; uploaded but NOT marked as latest.",
+                        step, TRAINER_STATE_FILE,
+                    )
+                    return
 
                 marker = {
                     "run_name": self.run_name,
@@ -179,7 +218,7 @@ class HubCheckpointSync:
                     marker.update(extra_metadata)
 
                 api.upload_file(
-                    path_or_fileobj=json.dumps(marker, indent=2).encode("utf-8"),
+                    path_or_fileobj=json.dumps(marker, indent=2, default=str).encode("utf-8"),
                     path_in_repo=self._latest_path,
                     repo_id=self.repo_id,
                     repo_type="model",
@@ -211,23 +250,47 @@ class HubCheckpointSync:
             self._thread.join(timeout)
         self._thread = None
 
-    def list_checkpoints(self) -> List[int]:
+    # ------------------------------------------------------------------- #
+    # Remote inventory
+    # ------------------------------------------------------------------- #
+    def _repo_files(self) -> Optional[List[str]]:
+        """Lists every file in the repo, or None if the listing failed."""
         try:
-            api = self._api()
-            files = api.list_repo_files(repo_id=self.repo_id, repo_type="model")
+            return self._api().list_repo_files(repo_id=self.repo_id, repo_type="model")
         except Exception as exc:
             log.warning("Could not list files in %s: %s", self.repo_id, exc)
-            return []
+            return None
 
-        steps = set()
+    def _steps_from_files(self, files: List[str]) -> Tuple[List[int], Set[int]]:
+        """Returns (all checkpoint steps, steps whose folder contains trainer_state.json)."""
         prefix = f"{self.run_prefix}/"
+        steps: Set[int] = set()
+        complete: Set[int] = set()
         for f in files:
             if not f.startswith(prefix):
                 continue
-            m = _CHECKPOINT_RE.search(f[len(prefix):])
-            if m:
-                steps.add(int(m.group(1)))
-        return sorted(steps)
+            m = _REMOTE_CKPT_FILE_RE.match(f[len(prefix):])
+            if not m:
+                continue
+            step = int(m.group(1))
+            steps.add(step)
+            if m.group(2) == TRAINER_STATE_FILE:
+                complete.add(step)
+        return sorted(steps), complete
+
+    def list_checkpoints(self) -> List[int]:
+        files = self._repo_files()
+        if files is None:
+            return []
+        steps, _complete = self._steps_from_files(files)
+        return steps
+
+    def list_resumable_checkpoints(self) -> List[int]:
+        files = self._repo_files()
+        if files is None:
+            return []
+        _steps, complete = self._steps_from_files(files)
+        return sorted(complete)
 
     def read_latest_marker(self) -> Optional[Dict[str, Any]]:
         from huggingface_hub import hf_hub_download
@@ -251,6 +314,9 @@ class HubCheckpointSync:
         steps = self.list_checkpoints()
         return steps[-1] if steps else None
 
+    # ------------------------------------------------------------------- #
+    # Download
+    # ------------------------------------------------------------------- #
     def pull(self, step: Optional[int] = None, dest: Optional[str | Path] = None
              ) -> Optional[Path]:
         """Downloads a remote checkpoint to a local destination directory."""
@@ -281,10 +347,62 @@ class HubCheckpointSync:
         log.info("Checkpoint ready at %s", resolved)
         return resolved
 
+    def pull_resumable(self, dest: Optional[str | Path] = None) -> Optional[Path]:
+        """Downloads the newest remote checkpoint that Trainer can resume from.
+
+        Folders without trainer_state.json (e.g. an adapter-only emergency save
+        from an older version of train.py) are skipped with a warning. Returns
+        None only when the run has no remote checkpoints at all. Raises if the
+        Hub cannot be listed or no checkpoint is resumable, so a run never
+        silently restarts from scratch over existing progress.
+        """
+        files = self._repo_files()
+        if files is None:
+            raise RuntimeError(
+                f"Could not list {self.repo_id} to find a checkpoint to resume from. "
+                "Check network access and HF_TOKEN, then rerun. Use --resume none only "
+                "if you really want to start this run from scratch."
+            )
+
+        steps, complete = self._steps_from_files(files)
+        if not steps:
+            log.info("No remote checkpoint found for run '%s'.", self.run_name)
+            return None
+
+        if not complete:
+            raise RuntimeError(
+                f"Remote checkpoints exist for '{self.run_name}' (steps {steps}) but none "
+                f"contains {TRAINER_STATE_FILE}, so none can be resumed. Rerun with "
+                "--resume none (or a new --run-name) to start over."
+            )
+
+        chosen = max(complete)
+        skipped = [s for s in steps if s > chosen]
+        if skipped:
+            log.warning(
+                "Skipping remote checkpoint(s) %s: no %s (adapter-only, not resumable). "
+                "Resuming from checkpoint-%d instead; up to %d optimizer steps will be repeated.",
+                ", ".join(f"checkpoint-{s}" for s in skipped), TRAINER_STATE_FILE,
+                chosen, max(skipped) - chosen,
+            )
+
+        marker = self.read_latest_marker()
+        if marker and marker.get("step") is not None and int(marker["step"]) != chosen:
+            log.warning("LATEST.json points to step %s; using resumable checkpoint-%d.",
+                        marker.get("step"), chosen)
+
+        pulled = self.pull(step=chosen, dest=dest)
+        if pulled is None or not is_resumable_checkpoint(pulled):
+            raise RuntimeError(
+                f"Downloaded checkpoint-{chosen} is missing {TRAINER_STATE_FILE}. "
+                "The Hub listing and the download disagree; rerun to retry."
+            )
+        return pulled
+
     def pull_final(self, dest: str | Path) -> Optional[Path]:
         """Downloads runs/<run_name>/final into `dest` (e.g. artifacts/runs/<run>/final).
 
-        Lets a fresh Colab session run predict/merge on an adapter that finished
+        Lets a fresh session run predict/merge on an adapter that finished
         training in an earlier session.
         """
         from huggingface_hub import snapshot_download
@@ -317,16 +435,32 @@ class HubCheckpointSync:
         log.info("Final adapter ready at %s", dest)
         return dest
 
+    # ------------------------------------------------------------------- #
+    # Retention
+    # ------------------------------------------------------------------- #
     def prune(self, keep_last: int, protect_step: Optional[int] = None) -> None:
-        """Removes older remote checkpoints to maintain the target retention count."""
+        """Removes older remote checkpoints, keeping the `keep_last` newest resumable ones.
+
+        Only resumable checkpoints count towards `keep_last`, so an adapter-only
+        folder can never push the last good checkpoint out of the window.
+        Nothing newer than the oldest kept resumable checkpoint is deleted.
+        """
         if keep_last <= 0:
             return
-        steps = self.list_checkpoints()
-        if len(steps) <= keep_last:
+        files = self._repo_files()
+        if files is None:
             return
-        doomed = steps[:-keep_last]
+        steps, complete = self._steps_from_files(files)
+        if not complete:
+            return
+
+        kept_complete = sorted(complete)[-keep_last:]
+        keep = set(kept_complete)
         if protect_step is not None:
-            doomed = [s for s in doomed if s != protect_step]
+            keep.add(protect_step)
+        floor = min(kept_complete)
+
+        doomed = [s for s in steps if s not in keep and s < floor]
         if not doomed:
             return
 
@@ -400,19 +534,14 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
             if sync.last_upload_error:
                 log.error(
                     "Previous checkpoint upload FAILED (%s). Until an upload succeeds, "
-                    "progress will NOT survive the end of this Colab session.",
+                    "progress will NOT survive the end of this session.",
                     sync.last_upload_error,
                 )
             ckpt_dir = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
             sync.push(
                 ckpt_dir,
                 step=state.global_step,
-                extra_metadata={
-                    "config_fingerprint": fingerprint,
-                    "epoch": state.epoch,
-                    "model_key": cfg.model.key,
-                    "schema_mode": cfg.data.schema_mode,
-                },
+                extra_metadata=checkpoint_metadata(cfg, fingerprint, state),
             )
             return control
 
@@ -534,7 +663,7 @@ def find_local_checkpoint(output_dir: Path) -> Optional[Path]:
         if not child.is_dir():
             continue
         m = _CHECKPOINT_RE.fullmatch(child.name)
-        if m and (child / "trainer_state.json").exists():
+        if m and is_resumable_checkpoint(child):
             candidates.append((int(m.group(1)), child))
     if not candidates:
         return None
@@ -573,7 +702,8 @@ def resolve_resume(cfg: RunConfig, mode: str,
                     remote_fp, fingerprint,
                 )
                 raise SystemExit(2)
-        pulled = sync.pull()
+
+        pulled = sync.pull_resumable()
         if pulled is None:
             log.info("No remote checkpoint found for '%s'; starting fresh.", cfg.run_name)
             return None
@@ -583,6 +713,8 @@ def resolve_resume(cfg: RunConfig, mode: str,
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(pulled, dest)
+        if not is_resumable_checkpoint(dest):
+            raise RuntimeError(f"Copied checkpoint {dest} is missing {TRAINER_STATE_FILE}.")
         log.info("Resuming from remote checkpoint at step %d (%s)", step, dest)
         return dest
 

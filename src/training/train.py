@@ -34,6 +34,8 @@ from src.logging_utils import get_logger
 from src.training.checkpointing import (
     HubCheckpointSync,
     build_callbacks,
+    checkpoint_metadata,
+    is_resumable_checkpoint,
     resolve_resume,
 )
 from src.training.model_loader import (
@@ -103,12 +105,57 @@ def _report_upload_failure(sync: Optional[HubCheckpointSync], context: str) -> b
         return False
     log.error("=" * 66)
     log.error("HUB UPLOAD FAILED (%s): %s", context, sync.last_upload_error)
-    log.error("Nothing from this session is safely on the Hub. If the Colab runtime is")
+    log.error("Nothing from this session is safely on the Hub. If the runtime is")
     log.error("reset, the next session will NOT resume from this point. Fix the upload")
     log.error("error, then push the local checkpoint manually before the runtime ends:")
     log.error("  python app.py checkpoint push --config <cfg> --path <output_dir>/checkpoint-<step>")
     log.error("=" * 66)
     return True
+
+
+def _save_emergency_checkpoint(trainer, output_dir: Path) -> Optional[Path]:
+    """Writes a full, resumable checkpoint-<step> after an interrupt.
+
+    Trainer.save_model() writes only the adapter weights (no trainer_state.json,
+    optimizer, scheduler or RNG state), which resume_from_checkpoint cannot use
+    (history/026.md). Trainer._save_checkpoint() writes the complete state.
+    Returns the checkpoint path, or None if no resumable checkpoint was written.
+    """
+    from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+    step = int(trainer.state.global_step)
+    if step <= 0:
+        log.warning("Interrupted before the first optimizer step; nothing to checkpoint.")
+        return None
+
+    ckpt = output_dir / f"{PREFIX_CHECKPOINT_DIR}-{step}"
+    if is_resumable_checkpoint(ckpt):
+        log.info("checkpoint-%d was already saved by the trainer.", step)
+        return ckpt
+
+    try:
+        try:
+            trainer._save_checkpoint(trainer.model, trial=None)
+        except TypeError:
+            # Older transformers: _save_checkpoint(model, trial, metrics=None)
+            trainer._save_checkpoint(trainer.model, None, None)
+    except Exception as exc:
+        log.error("Could not write a full emergency checkpoint: %s", exc)
+
+    if is_resumable_checkpoint(ckpt):
+        log.info("Emergency checkpoint written: %s", ckpt)
+        return ckpt
+
+    # Last resort: keep the adapter weights locally for inspection only. They are
+    # never uploaded as checkpoint-<step>, because that would break resume.
+    fallback = output_dir / "interrupted"
+    try:
+        trainer.save_model(str(fallback))
+        log.warning("Saved adapter weights only to %s (not resumable, not uploaded). "
+                    "The Hub keeps the last periodic checkpoint.", fallback)
+    except Exception as exc:
+        log.error("Could not save adapter weights after interrupt: %s", exc)
+    return None
 
 
 @dataclass
@@ -346,13 +393,21 @@ def run_training(cfg: RunConfig, resume: str = "auto") -> Path:
     try:
         result = trainer.train(resume_from_checkpoint=str(resume_from) if resume_from else None)
     except KeyboardInterrupt:
-        log.warning("Training interrupted by user. Saving emergency checkpoint.")
-        trainer.save_model(str(output_dir / "interrupted"))
+        log.warning("Training interrupted. Saving a resumable emergency checkpoint.")
+        ckpt = _save_emergency_checkpoint(trainer, output_dir)
         if sync is not None:
             sync.wait()
-            sync.push(output_dir / "interrupted",
-                      step=int(trainer.state.global_step), blocking=True)
-            _report_upload_failure(sync, "emergency checkpoint")
+            if ckpt is not None:
+                sync.push(
+                    ckpt,
+                    step=int(trainer.state.global_step),
+                    blocking=True,
+                    extra_metadata=checkpoint_metadata(cfg, cfg.fingerprint(), trainer.state),
+                )
+                _report_upload_failure(sync, "emergency checkpoint")
+            else:
+                log.warning("No resumable emergency checkpoint was written; "
+                            "the next session resumes from the last periodic checkpoint.")
         raise
     except oom_types:
         log.error(
@@ -379,10 +434,10 @@ def run_training(cfg: RunConfig, resume: str = "auto") -> Path:
             _report_upload_failure(sync, "last checkpoint before non-finite loss")
         raise SystemExit(EXIT_NONFINITE_LOSS)
 
-    # A wall-clock stop (Colab session budget) returns from trainer.train()
-    # normally, but the adapter is only partially trained. Writing it as "final"
-    # would let predict/merge -- and the notebook's skip-if-final logic -- treat
-    # an unfinished run as complete. The checkpoint saved at the stop is enough
+    # A wall-clock stop (session budget) returns from trainer.train() normally,
+    # but the adapter is only partially trained. Writing it as "final" would let
+    # predict/merge -- and the notebook's skip-if-final logic -- treat an
+    # unfinished run as complete. The checkpoint saved at the stop is enough
     # to resume.
     state = trainer.state
     if state.max_steps and state.global_step < state.max_steps:
