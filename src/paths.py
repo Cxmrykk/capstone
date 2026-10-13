@@ -1,4 +1,4 @@
-"""Path resolution that behaves identically on a local machine and on Colab."""
+"""Path resolution that behaves identically on a local machine, Colab and Kaggle."""
 from __future__ import annotations
 
 import os
@@ -36,6 +36,27 @@ def is_colab() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_kaggle() -> bool:
+    """True inside a Kaggle notebook session (interactive or committed batch run).
+
+    KAGGLE_KERNEL_RUN_TYPE is set in the container environment, so child
+    processes started by the notebook see it too.
+    """
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        return True
+    return Path("/kaggle/working").is_dir()
+
+
+def platform_name() -> str:
+    """Returns 'kaggle', 'colab' or 'local'."""
+    if is_kaggle():
+        return "kaggle"
+    if is_colab():
+        return "colab"
+    return "local"
+
+
+@lru_cache(maxsize=1)
 def data_dir() -> Path:
     env = os.environ.get("T2C_DATA_DIR")
     if env:
@@ -49,9 +70,11 @@ def artifacts_dir() -> Path:
     Scratch space for runs, predictions, reports and exports.
 
     Always <repo>/artifacts unless T2C_ARTIFACTS_DIR is set. On Colab the repo
-    lives on the VM's local disk (/content/capstone), so this is already fast,
-    and it keeps the relative `artifacts/...` paths used in the notebook valid.
-    Durability across Colab sessions comes from the Hub checkpoint sync.
+    lives on the VM's local disk (/content/capstone); on Kaggle the notebook
+    clones it into scratch storage (/kaggle/temp or /tmp), outside the size-capped
+    /kaggle/working output directory. Either way the relative `artifacts/...`
+    paths used in the notebooks stay valid. Durability across sessions comes
+    from the Hub checkpoint sync.
     """
     env = os.environ.get("T2C_ARTIFACTS_DIR")
     if env:

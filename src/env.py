@@ -1,8 +1,8 @@
 """Environment diagnostics and system compatibility checks for `app.py doctor`.
 
 Verifies GPU accelerator availability, VRAM allocation, precision capabilities
-(fp16 on NVIDIA Turing T4 vs bf16 on Ampere+), Python dependencies, and Neo4j
-connectivity.
+(fp16 on NVIDIA Turing T4 vs bf16 on Ampere+), visible GPU count, Python
+dependencies, and Neo4j connectivity. Runs on Colab, Kaggle and local machines.
 """
 from __future__ import annotations
 
@@ -15,7 +15,15 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from src.paths import artifacts_dir, data_dir, dataset_dir, is_colab, repo_root
+from src.paths import (
+    artifacts_dir,
+    data_dir,
+    dataset_dir,
+    is_colab,
+    is_kaggle,
+    platform_name,
+    repo_root,
+)
 
 # (display name, distribution name). Versions are read from package metadata,
 # never by importing: importing unsloth after transformers/peft prints an
@@ -41,6 +49,18 @@ _PACKAGES: List[Tuple[str, str]] = [
 # Granite 4.2 3B dense-transformer control.
 _MODEL_DIRS = ["gemma-4-E2B", "Qwen3.5-2B", "granite-4.2-3b"]
 
+_PLATFORM_LABELS = {
+    "colab": "Google Colab",
+    "kaggle": "Kaggle",
+    "local": "Standalone / Local",
+}
+
+_GPU_HINTS = {
+    "colab": "Colab: Runtime > Change runtime type > T4 GPU",
+    "kaggle": "Kaggle: Settings > Accelerator > GPU T4 x2 (phone-verified account)",
+    "local": "attach an NVIDIA GPU with CUDA drivers",
+}
+
 
 def _package_versions() -> Dict[str, str]:
     """Reads installed package versions from metadata without importing them."""
@@ -64,6 +84,8 @@ def _torch_info() -> Dict[str, Any]:
         "total_vram_gb": None,
         "bf16_supported": False,
         "recommended_dtype": "float32",
+        "device_count": 0,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
     try:
         import torch
@@ -78,9 +100,11 @@ def _torch_info() -> Dict[str, Any]:
 
     info["cuda"] = True
     info["cuda_version"] = torch.version.cuda
+    info["device_count"] = torch.cuda.device_count()
     props = torch.cuda.get_device_properties(0)
     info["device_name"] = props.name
     info["capability"] = f"{props.major}.{props.minor}"
+    info["capability_major"] = props.major
     info["total_vram_gb"] = round(props.total_memory / (1024 ** 3), 2)
 
     # Native bf16 needs Ampere (sm_80) or newer. torch.cuda.is_bf16_supported()
@@ -165,7 +189,10 @@ def environment_report(check_neo4j: bool = False) -> Dict[str, Any]:
     report: Dict[str, Any] = {
         "python": sys.version.split()[0],
         "platform": platform.platform(),
+        "platform_name": platform_name(),
         "is_colab": is_colab(),
+        "is_kaggle": is_kaggle(),
+        "kaggle_run_type": os.environ.get("KAGGLE_KERNEL_RUN_TYPE"),
         "repo_root": str(repo_root()),
         "data_dir": str(data_dir()),
         "artifacts_dir": str(artifacts_dir()),
@@ -201,13 +228,28 @@ def environment_report(check_neo4j: bool = False) -> Dict[str, Any]:
 def _warnings(r: Dict[str, Any]) -> List[str]:
     warns: List[str] = []
     t = r["torch"]
+    plat = r.get("platform_name", "local")
 
     if not t["available"]:
         warns.append("PyTorch is not installed -- training and PyTorch inference are unavailable.")
     elif not t["cuda"]:
         warns.append("No CUDA GPU detected. Model fine-tuning requires GPU acceleration "
-                     "(Colab: Runtime > Change runtime type > T4 GPU).")
+                     f"({_GPU_HINTS.get(plat, _GPU_HINTS['local'])}).")
     else:
+        major = t.get("capability_major") or 0
+        if major and major < 7:
+            warns.append(
+                f"{t['device_name']} (sm_{t['capability']}) is older than Turing. Recent PyTorch "
+                "CUDA builds are dropping Pascal support and the configs are tuned for a T4. "
+                "On Kaggle, choose the GPU T4 x2 accelerator instead of P100."
+            )
+        if t.get("device_count", 1) > 1:
+            warns.append(
+                f"{t['device_count']} CUDA devices are visible. Without torchrun, HF Trainer wraps "
+                "the model in nn.DataParallel, which is fragile with 4-bit bitsandbytes models and "
+                "doubles the effective batch size versus single-GPU runs. Set CUDA_VISIBLE_DEVICES=0 "
+                "(kaggle.ipynb does this automatically)."
+            )
         if not t["bf16_supported"]:
             emulated = " (PyTorch reports emulated bf16 only)" if t.get("bf16_emulated") else ""
             warns.append(
@@ -241,8 +283,12 @@ def _warnings(r: Dict[str, Any]) -> List[str]:
     if not r["hf_token_present"]:
         warns.append("HF_TOKEN is not set -- gated model access and remote checkpoint sync may fail.")
     if not r.get("hub_repo"):
+        lost = {
+            "colab": "lost when the Colab runtime resets",
+            "kaggle": "lost when the Kaggle session ends",
+        }.get(plat, "not backed up remotely")
         warns.append("T2C_HUB_REPO is not set and configs use hub.repo_id: null -- "
-                     "checkpoints will only be kept locally and are lost when Colab resets.")
+                     f"checkpoints will only be kept locally and are {lost}.")
 
     if not r["llama_cpp_dir"] and not r["binaries"].get("llama-cli"):
         warns.append("llama.cpp not found -- run scripts/build_llama_cpp.sh before GGUF export.")
@@ -254,12 +300,17 @@ def render_report(r: Dict[str, Any]) -> str:
     lines: List[str] = []
     add = lines.append
 
+    plat = r.get("platform_name", "local")
+    env_label = _PLATFORM_LABELS.get(plat, plat)
+    if plat == "kaggle" and r.get("kaggle_run_type"):
+        env_label = f"{env_label} ({r['kaggle_run_type']} session)"
+
     add("=" * 68)
     add("  Text2Cypher System Diagnostic Report")
     add("=" * 68)
     add(f"Python          : {r['python']}")
     add(f"Platform        : {r['platform']}")
-    add(f"Environment     : {'Google Colab' if r['is_colab'] else 'Standalone / Local'}")
+    add(f"Environment     : {env_label}")
     add(f"Repository Root : {r['repo_root']}")
     add(f"Artifacts Dir   : {r['artifacts_dir']}")
     add(f"Hub Repo        : {r.get('hub_repo') or '-'}")
@@ -274,7 +325,10 @@ def render_report(r: Dict[str, Any]) -> str:
             bf16_text = "Emulated only (not used)"
         else:
             bf16_text = "Not Supported"
+        visible = t.get("cuda_visible_devices")
         add(f"Device          : {t['device_name']} (sm_{t['capability']})")
+        add(f"Visible GPUs    : {t.get('device_count', 1)}"
+            + (f" (CUDA_VISIBLE_DEVICES={visible})" if visible is not None else ""))
         add(f"VRAM            : {t['total_vram_gb']} GB")
         add(f"CUDA Version    : {t.get('cuda_version')}")
         add(f"bfloat16        : {bf16_text}")
