@@ -10,7 +10,8 @@ loss anyway, so TargetOnlyLossTrainer asks the model for logits over only the
 trailing positions that contain target Cypher tokens.
 
 Exit codes raised here: 3 = non-finite loss, 4 = paused at the wall-clock
-limit before the schedule finished (resume with --resume auto).
+limit before the schedule finished (resume with --resume auto), 5 = training
+finished but the final adapter is not on the Hub (run `checkpoint push-final`).
 """
 from __future__ import annotations
 
@@ -49,6 +50,7 @@ log = get_logger(__name__)
 
 EXIT_NONFINITE_LOSS = 3
 EXIT_TIME_LIMIT = 4
+EXIT_FINAL_UPLOAD = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -490,16 +492,27 @@ def run_training(cfg: RunConfig, resume: str = "auto") -> Path:
         json.dumps(metadata, indent=2, default=str), encoding="utf-8"
     )
 
+    final_on_hub = True
     if sync is not None:
         sync.wait()
         if not sync.push_final(final_dir, metadata):
+            final_on_hub = False
             _report_upload_failure(sync, "final adapter")
-            log.error("The final adapter exists locally at %s and can be used in this session, "
-                      "but a fresh session will retrain unless it is uploaded.", final_dir)
+    elif cfg.hub.sync:
+        final_on_hub = False
+        log.error("Hub sync was requested but was unavailable for this run.")
 
     log.info("=" * 66)
     log.info("Training completed in %.1f min at step %d.",
              (time.time() - t_start) / 60, trainer.state.global_step)
     log.info("Saved final adapter: %s", final_dir)
     log.info("=" * 66)
+
+    if not final_on_hub:
+        log.error(
+            "Exiting with code %d: the final adapter exists only locally (%s). Upload it before "
+            "the session ends: python app.py checkpoint push-final --config <cfg>",
+            EXIT_FINAL_UPLOAD, final_dir,
+        )
+        raise SystemExit(EXIT_FINAL_UPLOAD)
     return final_dir

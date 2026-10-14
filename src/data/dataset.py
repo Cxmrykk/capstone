@@ -200,6 +200,60 @@ def _target_ids(tokenizer, target: str) -> List[int]:
     return ids
 
 
+@dataclass
+class FittedPrompt:
+    """A rendered prompt sized to the sequence budget (see fit_prompt_to_budget)."""
+
+    prompt: str
+    prompt_ids: List[int]
+    schema_text: str
+    schema_chars_untrimmed: int
+    schema_trimmed: bool
+    over_budget: bool
+
+
+def fit_prompt_to_budget(
+    tokenizer,
+    question: str,
+    schema_text: str,
+    cfg: RunConfig,
+    supports_system: bool,
+    reserve_tokens: int,
+    max_attempts: int = 5,
+) -> FittedPrompt:
+    """Renders the prompt, trimming schema property lines until
+    len(prompt_ids) + reserve_tokens <= data.max_seq_length.
+
+    Shared by training (reserve = target length) and inference (reserve =
+    generation budget) so both apply the same rule (history/030.md).
+    Relationship patterns are never trimmed (trim_schema_text). If the prompt
+    still overflows after max_attempts, over_budget is True and the caller
+    decides what to do (training keeps the tail of the token ids, as before).
+    """
+    max_len = cfg.data.max_seq_length
+    untrimmed_chars = len(schema_text)
+    trimmed = False
+    over_budget = False
+    prompt = ""
+    prompt_ids: List[int] = []
+    for attempt in range(max_attempts):
+        prompt = render_prompt(
+            tokenizer, question, schema_text,
+            supports_system_role=supports_system,
+            chat_template_kwargs=cfg.model.spec.chat_template_kwargs,
+        )
+        prompt_ids = _flatten_ids(tokenizer(text=prompt, add_special_tokens=False)["input_ids"])
+        overflow = len(prompt_ids) + reserve_tokens - max_len
+        if overflow <= 0:
+            break
+        trimmed = True
+        if attempt == max_attempts - 1:
+            over_budget = True
+            break
+        schema_text = trim_schema_text(schema_text, int(overflow * 3.5) + 64)
+    return FittedPrompt(prompt, prompt_ids, schema_text, untrimmed_chars, trimmed, over_budget)
+
+
 def tokenize_examples(
     records: Sequence[Dict[str, Any]],
     cfg: RunConfig,
@@ -238,26 +292,16 @@ def tokenize_examples(
             n_dropped += 1
             continue
 
-        prompt_ids: List[int] = []
-        trimmed_this_row = False
-        for attempt in range(5):
-            prompt = render_prompt(
-                tokenizer, question, schema_text,
-                supports_system_role=supports_system,
-                chat_template_kwargs=cfg.model.spec.chat_template_kwargs,
-            )
-            # Use text= kwarg explicitly and flatten multimodal outputs
-            prompt_ids = _flatten_ids(tokenizer(text=prompt, add_special_tokens=False)["input_ids"])
-            overflow = len(prompt_ids) + len(target_ids) - max_len
-            if overflow <= 0:
-                break
-            trimmed_this_row = True
-            schema_text = trim_schema_text(schema_text, int(overflow * 3.5) + 64)
-            if attempt == 4:
-                keep = max_len - len(target_ids)
-                prompt_ids = prompt_ids[-keep:] if keep > 0 else []
-
-        if trimmed_this_row:
+        fitted = fit_prompt_to_budget(
+            tokenizer, question, schema_text, cfg, supports_system,
+            reserve_tokens=len(target_ids),
+        )
+        prompt_ids = fitted.prompt_ids
+        if fitted.over_budget:
+            # Unchanged last resort from the original loop: keep the prompt's tail.
+            keep = max_len - len(target_ids)
+            prompt_ids = prompt_ids[-keep:] if keep > 0 else []
+        if fitted.schema_trimmed:
             n_trimmed += 1
 
         input_ids = prompt_ids + target_ids

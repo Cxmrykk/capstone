@@ -34,6 +34,11 @@ _REMOTE_CKPT_FILE_RE = re.compile(r"^checkpoint-(\d+)/(.+)$")
 
 TRAINER_STATE_FILE = "trainer_state.json"
 
+
+class HubTransferError(RuntimeError):
+    """The Hub could not be listed or a transfer failed. Distinct from 'not found'."""
+
+
 _IGNORE_PATTERNS = [
     "*.gguf",
     "global_step*/*",
@@ -146,6 +151,18 @@ class HubCheckpointSync:
         self._repo_ready = True
         log.info("Remote checkpoint repository verified: %s (private=%s, run=%s)",
                  self.repo_id, self.private, self.run_name)
+
+    def _retry(self, what: str, fn, attempts: int = 3, base_delay_s: float = 10.0):
+        last: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return fn()
+            except Exception as exc:
+                last = exc
+                log.warning("%s failed (attempt %d/%d): %s", what, attempt, attempts, exc)
+                if attempt < attempts:
+                    time.sleep(base_delay_s * attempt)
+        raise HubTransferError(f"{what} failed after {attempts} attempts: {last}") from last
 
     # ------------------------------------------------------------------- #
     # Upload
@@ -399,33 +416,45 @@ class HubCheckpointSync:
             )
         return pulled
 
-    def pull_final(self, dest: str | Path) -> Optional[Path]:
-        """Downloads runs/<run_name>/final into `dest` (e.g. artifacts/runs/<run>/final).
+    def pull_final(self, dest: str | Path, attempts: int = 3) -> Optional[Path]:
+        """Downloads runs/<run_name>/final into `dest`.
 
-        Lets a fresh session run predict/merge on an adapter that finished
-        training in an earlier session.
+        Returns None only when the Hub listing succeeds and shows no final
+        adapter. Raises HubTransferError when the Hub cannot be listed, the
+        download fails after retries, or the remote folder is incomplete, so a
+        network error is never mistaken for "not trained yet" (history/030.md).
         """
         from huggingface_hub import snapshot_download
 
-        staging = ensure_dir(artifacts_dir() / "hub_pull" / self.run_name)
         prefix = f"{self.run_prefix}/final"
-        log.info("Downloading %s from %s ...", prefix, self.repo_id)
-        try:
-            snapshot_download(
-                repo_id=self.repo_id,
-                repo_type="model",
-                token=self.token,
-                allow_patterns=[f"{prefix}/*"],
-                local_dir=str(staging),
-            )
-        except Exception as exc:
-            log.error("Could not download final adapter: %s", exc)
-            return None
-
-        src = staging / self.run_prefix / "final"
-        if not src.exists() or not any(src.iterdir()):
+        files = self._retry(
+            f"Listing {self.repo_id}",
+            lambda: self._api().list_repo_files(repo_id=self.repo_id, repo_type="model"),
+            attempts,
+        )
+        final_files = [f for f in files if f.startswith(prefix + "/")]
+        if not final_files:
             log.info("No final adapter found for run '%s'.", self.run_name)
             return None
+        if f"{prefix}/adapter_config.json" not in final_files:
+            raise HubTransferError(
+                f"{prefix} exists on the Hub but has no adapter_config.json (incomplete upload)."
+            )
+
+        staging = ensure_dir(artifacts_dir() / "hub_pull" / self.run_name)
+        log.info("Downloading %s from %s ...", prefix, self.repo_id)
+        self._retry(
+            f"Downloading {prefix}",
+            lambda: snapshot_download(
+                repo_id=self.repo_id, repo_type="model", token=self.token,
+                allow_patterns=[f"{prefix}/*"], local_dir=str(staging),
+            ),
+            attempts,
+        )
+
+        src = staging / self.run_prefix / "final"
+        if not (src / "adapter_config.json").is_file() or not any(src.glob("adapter_model.*")):
+            raise HubTransferError(f"Downloaded {prefix} is missing adapter files.")
 
         dest = Path(dest)
         if dest.exists():
@@ -627,6 +656,48 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
                 fh.write(json.dumps(row, default=str) + "\n")
             return control
 
+    class MetricsMirrorCallback(TrainerCallback):
+        """Mirrors metrics.jsonl to the Hub at most once per interval (one commit each).
+
+        The notebooks archive metrics.jsonl only when a lane ends normally, so a
+        session killed by the platform lost its logs (history/030.md). Skips a
+        turn instead of blocking when a checkpoint upload holds the sync lock.
+        """
+
+        def __init__(self, path: Path, interval_s: float) -> None:
+            self.path = path
+            self.interval_s = float(interval_s)
+            self.last = time.time()
+            self.last_size = -1
+            session = os.environ.get("T2C_SESSION") or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            self.path_in_repo = f"{sync.run_prefix}/telemetry/{session}/metrics.jsonl"
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not state.is_world_process_zero or time.time() - self.last < self.interval_s:
+                return control
+            if not self.path.is_file():
+                return control
+            size = self.path.stat().st_size
+            if size == self.last_size:
+                self.last = time.time()
+                return control
+            if not sync._lock.acquire(blocking=False):
+                return control  # Checkpoint upload in progress; retry at the next log.
+            try:
+                sync._api().upload_file(
+                    path_or_fileobj=str(self.path), path_in_repo=self.path_in_repo,
+                    repo_id=sync.repo_id, repo_type="model",
+                    commit_message=f"[{sync.run_name}] metrics step {state.global_step}",
+                )
+                self.last_size = size
+                log.info("Mirrored metrics.jsonl to %s.", self.path_in_repo)
+            except Exception as exc:
+                log.warning("metrics.jsonl mirror failed: %s", exc)
+            finally:
+                sync._lock.release()
+                self.last = time.time()  # At most one attempt per interval, even on failure.
+            return control
+
     class VramLogger(TrainerCallback):
         """Records peak GPU memory allocation."""
 
@@ -649,6 +720,9 @@ def build_callbacks(cfg: RunConfig, sync: Optional[HubCheckpointSync],
         callbacks.append(NonFiniteLossGuard(cfg.train.nan_guard_patience))
     callbacks.append(VramLogger())
     callbacks.append(JsonlLossLogger(cfg.resolved_output_dir() / "metrics.jsonl"))
+    if sync is not None and sync.enabled and cfg.hub.metrics_upload_interval_s:
+        callbacks.append(MetricsMirrorCallback(cfg.resolved_output_dir() / "metrics.jsonl",
+                                               cfg.hub.metrics_upload_interval_s))
     return callbacks
 
 

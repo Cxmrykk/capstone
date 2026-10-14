@@ -233,6 +233,9 @@ class HubConfig:
     token_env: str = "HF_TOKEN"
     async_upload: bool = True
     drive_mirror: Optional[str] = None
+    # Mirror metrics.jsonl to runs/<run>/telemetry/<session>/ at most once per
+    # interval (one commit each), so a killed session keeps its logs. None disables.
+    metrics_upload_interval_s: Optional[float] = 3600.0
 
 
 @dataclass
@@ -246,6 +249,10 @@ class GenerationConfig:
     stop_strings: List[str] = field(default_factory=lambda: [
         "\n\n\n", "<|im_end|>", "<end_of_turn>", "<|end_of_text|>",
     ])
+    # Tokens reserved for the answer when fitting an inference prompt into
+    # data.max_seq_length (schema property lines are trimmed as in training).
+    # None = max_new_tokens, so prompt + generation never exceeds trained positions.
+    prompt_target_reserve: Optional[int] = None
 
 
 @dataclass
@@ -264,6 +271,9 @@ class Neo4jConfig:
     order_sensitive: bool = True           # Maintain row order when ORDER BY is in gold query
     compare_keys: bool = False             # Validate returned column names in addition to values
     float_ndigits: int = 6
+    # Databases whose gold queries ALL fail: "flag" marks rows (dead_database=True);
+    # "exclude" also removes them from the toolkit execution metrics.
+    dead_db_policy: str = "flag"
 
 
 @dataclass

@@ -12,9 +12,12 @@ Usage:
     python app.py export gguf --merged artifacts/merged/<name> --quant Q4_K_M
     python app.py checkpoint list --config ...
     python app.py checkpoint pull --config ... --step final
+    python app.py checkpoint push-final --config ...
 
 Exit codes for `train`: 0 finished, 2 config drift vs remote checkpoint,
-3 non-finite loss, 4 paused at the time limit (resume with --resume auto).
+3 non-finite loss, 4 paused at the time limit (resume with --resume auto),
+5 finished but the final adapter is not on the Hub (run checkpoint push-final).
+Exit codes for `checkpoint pull --step final`: 0 found, 1 not found, 6 Hub error.
 """
 from __future__ import annotations
 
@@ -112,6 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--limit", type=int, default=None)
     e.add_argument("--out", default=None)
     e.add_argument("--no-cache", action="store_true", help="Bypass local query result cache.")
+    e.add_argument("--dead-db-policy", default=None, choices=["flag", "exclude"],
+                   help="Databases where every gold query fails: flag rows, or also exclude them.")
 
     # ---- export ----------------------------------------------------------- #
     x = sub.add_parser("export", help="Merge LoRA adapters and convert to quantized GGUF format.")
@@ -150,6 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
     cu.add_argument("--config", required=True)
     cu.add_argument("--path", required=True)
     cu.add_argument("--run-name", default=None)
+
+    cf = c_sub.add_parser("push-final", help="Upload a local final adapter to runs/<run>/final on the Hub.")
+    cf.add_argument("--config", required=True)
+    cf.add_argument("--run-name", default=None)
+    cf.add_argument("--path", default=None, help="Defaults to artifacts/runs/<run>/final.")
 
     # ---- neo4j ------------------------------------------------------------ #
     n = sub.add_parser("neo4j", help="Neo4j connectivity and schema utility helpers.")
@@ -298,6 +308,7 @@ def cmd_evaluate(args) -> int:
         limit=args.limit,
         out_path=args.out,
         use_cache=not args.no_cache,
+        dead_db_policy=args.dead_db_policy,
     )
     return 0
 
@@ -331,7 +342,7 @@ def cmd_export(args) -> int:
 
 def cmd_checkpoint(args) -> int:
     from src.config import load_config
-    from src.training.checkpointing import HubCheckpointSync
+    from src.training.checkpointing import HubCheckpointSync, HubTransferError
 
     cfg = load_config(args.config)
     run_name = getattr(args, "run_name", None) or cfg.run_name
@@ -356,7 +367,11 @@ def cmd_checkpoint(args) -> int:
     if args.checkpoint_command == "pull":
         if args.step == "final":
             dest = Path(args.dest) if args.dest else cfg.resolved_output_dir() / "final"
-            out = sync.pull_final(dest)
+            try:
+                out = sync.pull_final(dest)
+            except HubTransferError as exc:
+                print(f"ERROR: could not fetch the final adapter for '{run_name}': {exc}")
+                return 6
             if out is None:
                 print(f"No final adapter found for run '{run_name}' in {sync.repo_id}.")
                 return 1
@@ -376,6 +391,17 @@ def cmd_checkpoint(args) -> int:
         sync.push(path, step=step, blocking=True)
         print(f"Uploaded {path} as checkpoint-{step}")
         return 0
+
+    if args.checkpoint_command == "push-final":
+        path = Path(args.path) if args.path else cfg.resolved_output_dir() / "final"
+        if not (path / "adapter_config.json").is_file():
+            print(f"No adapter_config.json in {path}; nothing to upload.")
+            return 1
+        # run_metadata.json is inside the folder already, so no second commit is needed.
+        ok = sync.push_final(path, metadata=None)
+        print(f"Uploaded {path} to {sync.repo_id}/{sync.run_prefix}/final" if ok
+              else f"Upload FAILED: {sync.last_upload_error}")
+        return 0 if ok else 5
 
     raise SystemExit(f"Unknown checkpoint subcommand: {args.checkpoint_command}")
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +27,41 @@ def _load_meta(pred_path: Path) -> Dict[str, Any]:
     return {}
 
 
+def gold_health(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per database: how many gold queries failed, and the most common errors."""
+    by_db: Dict[str, List[Dict]] = defaultdict(list)
+    for row in rows:
+        status = row.get("execution_status")
+        if status is None or status == "connection_failed":
+            continue
+        by_db[row.get("database_reference") or "(none)"].append(row)
+    out: List[Dict[str, Any]] = []
+    for db, subset in sorted(by_db.items()):
+        failed = [r for r in subset if not r.get("gold_executed_ok")]
+        if not failed:
+            continue
+        errors = Counter((r.get("gold_error") or "unknown")[:300] for r in failed)
+        out.append({
+            "database_reference": db,
+            "n_executed": len(subset),
+            "n_gold_failed": len(failed),
+            "gold_failure_rate": round(len(failed) / len(subset), 4),
+            "dead": len(failed) == len(subset),
+            "gold_errors": [{"error": e, "count": c} for e, c in errors.most_common(5)],
+        })
+    return out
+
+
+def _log_gold_health(health: List[Dict[str, Any]]) -> None:
+    for h in health:
+        emit = log.error if h["dead"] else log.warning
+        emit("%s gold queries fail on %s: %d/%d%s",
+             "ALL" if h["dead"] else "Some", h["database_reference"],
+             h["n_gold_failed"], h["n_executed"], " (dead database)" if h["dead"] else "")
+        for item in h["gold_errors"]:
+            emit("    x%d  %s", item["count"], item["error"])
+
+
 def evaluate_file(
     pred_path: Path,
     cfg: RunConfig,
@@ -35,6 +70,7 @@ def evaluate_file(
     only_db: Optional[str] = None,
     limit: Optional[int] = None,
     use_cache: bool = True,
+    dead_db_policy: str = "flag",
 ) -> Dict[str, Any]:
     """Scores a single JSONL predictions file across text and execution metrics."""
     rows = read_jsonl(pred_path)
@@ -85,12 +121,38 @@ def evaluate_file(
         log.info("Execution phase completed in %.1fs (skipped: %d without database, %d filtered).",
                  time.time() - t0, skipped_no_db, skipped_filtered)
 
+    health: List[Dict[str, Any]] = []
+    dead: set = set()
+    if execute:
+        health = gold_health(rows)
+        _log_gold_health(health)
+        dead = {h["database_reference"] for h in health if h["dead"]}
+        for row in rows:
+            if row.get("execution_status") in (None, "connection_failed"):
+                continue
+            row["dead_database"] = (row.get("database_reference") or "(none)") in dead
+            if row["dead_database"] and dead_db_policy == "exclude":
+                row["execution_status"] = "excluded_dead_db"
+                row["execution_match"] = None
+        n_conn = sum(1 for r in rows if r.get("execution_status") == "connection_failed")
+        if n_conn:
+            log.error("%d rows could not be executed because Neo4j was unreachable; they are "
+                      "excluded from execution metrics (status connection_failed). Rerun them.", n_conn)
+
     report: Dict[str, Any] = {
         "predictions_file": str(pred_path),
         "n_rows": len(rows),
         "meta": meta,
         "overall": summarise(rows),
     }
+    report["gold_health"] = health
+    report["dead_databases"] = sorted(dead)
+    report["dead_db_policy"] = dead_db_policy
+
+    grouped_access: Dict[str, List[Dict]] = defaultdict(list)
+    for row in rows:
+        grouped_access["with_database" if row.get("database_reference") else "no_database"].append(row)
+    report["by_database_access"] = {k: summarise(v) for k, v in sorted(grouped_access.items())}
 
     # Breakdown by topological complexity
     by_complexity: Dict[str, Dict[str, float]] = {}
@@ -198,12 +260,24 @@ def render_markdown(reports: List[Dict[str, Any]]) -> str:
                 )
             lines.append("")
 
+        if rep.get("gold_health"):
+            lines.append("### Gold-Query Health")
+            lines.append("")
+            lines.append("| Database | Executed | Gold failed | Dead | Most common error |")
+            lines.append("|---|---|---|---|---|")
+            for h in rep["gold_health"]:
+                err = (h["gold_errors"][0]["error"] if h["gold_errors"] else "").replace("|", "/")[:120]
+                lines.append(f"| {h['database_reference']} | {h['n_executed']} | {h['n_gold_failed']} | "
+                             f"{'yes' if h['dead'] else 'no'} | {err} |")
+            lines.append("")
+
     lines.append("---")
     lines.append("")
     lines.append("**Definitions:** Google-BLEU (GLEU) measures code-aware n-gram overlap. "
                  "Exact Match validates exact query string equality; Normalised Exact Match "
                  "ignores whitespace and keyword casing. Executable indicates queries running without "
-                 "syntax errors. Execution Accuracy validates result set equivalence with the reference query.")
+                 "syntax errors. Execution Accuracy validates result set equivalence with the reference query. "
+                 "Rows with status connection_failed or excluded_dead_db are not scored.")
     return "\n".join(lines)
 
 
@@ -216,10 +290,13 @@ def evaluate_files(
     limit: Optional[int] = None,
     out_path: Optional[str] = None,
     use_cache: bool = True,
+    dead_db_policy: Optional[str] = None,
 ) -> Path:
     cfg = RunConfig()
     if provider:
         cfg.neo4j.provider = provider
+    if dead_db_policy:
+        cfg.neo4j.dead_db_policy = dead_db_policy
 
     reports: List[Dict[str, Any]] = []
     for raw_path in prediction_files:
@@ -234,6 +311,7 @@ def evaluate_files(
             only_db=only_db,
             limit=limit,
             use_cache=use_cache,
+            dead_db_policy=cfg.neo4j.dead_db_policy,
         ))
 
     if not reports:

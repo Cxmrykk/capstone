@@ -2,6 +2,8 @@
 
 Runs inference across dataset partitions using either Transformers or GGUF backends,
 extracts Cypher statements, records latency metrics, and writes JSONL outputs.
+Prompts are fitted to data.max_seq_length with the same schema-trimming rule
+as training (history/030.md).
 """
 from __future__ import annotations
 
@@ -12,8 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.config import RunConfig
-from src.data.dataset import _flatten_ids, load_raw_split, subsample, write_jsonl
-from src.data.prompts import extract_cypher, render_prompt, template_supports_system
+from src.data.dataset import fit_prompt_to_budget, load_raw_split, subsample, write_jsonl
+from src.data.prompts import extract_cypher, template_supports_system
 from src.data.schema_filter import apply_schema_mode
 from src.inference import get_backend
 from src.logging_utils import get_logger
@@ -29,12 +31,10 @@ def _default_out_name(cfg: RunConfig, backend_name: str, split: str,
     return f"{label}__{cfg.model.key}__{cfg.data.schema_mode}__{backend_name}__{split}__{stamp}.jsonl"
 
 
-def _count_tokens(tokenizer, prompt: str) -> int:
-    """Counts prompt tokens; text= avoids multimodal processors treating input as an image."""
-    try:
-        return len(_flatten_ids(tokenizer(text=prompt, add_special_tokens=False)["input_ids"]))
-    except Exception:
-        return -1
+def prompt_reserve_tokens(cfg: RunConfig) -> int:
+    """Tokens kept free for the generated query when fitting the prompt."""
+    reserve = cfg.generation.prompt_target_reserve
+    return int(reserve) if reserve is not None else int(cfg.generation.max_new_tokens)
 
 
 def run_prediction(
@@ -53,7 +53,7 @@ def run_prediction(
     if adapter and not Path(adapter).exists():
         raise FileNotFoundError(
             f"Adapter not found: {adapter}\n"
-            "If training finished in an earlier Colab session, download it first:\n"
+            "If training finished in an earlier session, download it first:\n"
             f"  python app.py checkpoint pull --config <cfg> --step final"
         )
 
@@ -82,9 +82,9 @@ def run_prediction(
     if supports_system is None:
         supports_system = template_supports_system(tokenizer)
 
+    reserve = prompt_reserve_tokens(cfg)
     prompts: List[str] = []
-    schema_texts: List[str] = []
-    prompt_tokens: List[int] = []
+    fitted_rows = []
 
     for rec in records:
         question = rec.get("question") or ""
@@ -95,14 +95,21 @@ def run_prediction(
             similarity_threshold=cfg.data.similarity_threshold,
             similarity_model=cfg.data.similarity_model,
         )
-        prompt = render_prompt(
-            tokenizer, question, schema_text,
-            supports_system_role=supports_system,
-            chat_template_kwargs=cfg.model.spec.chat_template_kwargs,
+        fitted = fit_prompt_to_budget(
+            tokenizer, question, schema_text, cfg, supports_system, reserve_tokens=reserve,
         )
-        prompts.append(prompt)
-        schema_texts.append(schema_text)
-        prompt_tokens.append(_count_tokens(tokenizer, prompt))
+        prompts.append(fitted.prompt)
+        fitted_rows.append(fitted)
+
+    n_trimmed = sum(1 for f in fitted_rows if f.schema_trimmed)
+    n_over = sum(1 for f in fitted_rows if f.over_budget)
+    log.info("Prompt budget: %d tokens (max_seq_length %d - reserve %d). Schema-trimmed: %d/%d; "
+             "still over budget after trimming: %d.",
+             cfg.data.max_seq_length - reserve, cfg.data.max_seq_length, reserve,
+             n_trimmed, len(fitted_rows), n_over)
+    if n_over:
+        log.warning("%d prompts exceed the budget even after trimming; they are sent untruncated "
+                    "and flagged prompt_over_budget=True.", n_over)
 
     t0 = time.time()
     raw_outputs = backend.generate(
@@ -116,7 +123,7 @@ def run_prediction(
     backend.close()
 
     rows: List[Dict[str, Any]] = []
-    for rec, schema_text, n_tok, raw in zip(records, schema_texts, prompt_tokens, raw_outputs):
+    for rec, fitted, raw in zip(records, fitted_rows, raw_outputs):
         rows.append({
             "instance_id": rec.get("instance_id"),
             "question": rec.get("question"),
@@ -126,8 +133,11 @@ def run_prediction(
             "database_reference": rec.get("database_reference"),
             "data_source": rec.get("data_source"),
             "schema_mode": cfg.data.schema_mode,
-            "schema_chars": len(schema_text),
-            "prompt_tokens": n_tok,
+            "schema_chars": len(fitted.schema_text),
+            "schema_chars_untrimmed": fitted.schema_chars_untrimmed,
+            "schema_trimmed": fitted.schema_trimmed,
+            "prompt_over_budget": fitted.over_budget,
+            "prompt_tokens": len(fitted.prompt_ids),
         })
 
     out = Path(out_path) if out_path else predictions_dir() / _default_out_name(
@@ -135,7 +145,7 @@ def run_prediction(
     )
     write_jsonl(out, rows)
 
-    valid_tokens = [t for t in prompt_tokens if t >= 0]
+    token_counts = [len(f.prompt_ids) for f in fitted_rows]
     meta = {
         "run_name": cfg.run_name,
         "tag": tag,
@@ -148,12 +158,16 @@ def run_prediction(
         "split": split,
         "n_instances": len(rows),
         "schema_mode": cfg.data.schema_mode,
+        "max_seq_length": cfg.data.max_seq_length,
+        "prompt_reserve_tokens": reserve,
+        "n_schema_trimmed": n_trimmed,
+        "n_prompt_over_budget": n_over,
         "max_new_tokens": cfg.generation.max_new_tokens,
         "temperature": cfg.generation.temperature,
         "batch_size": cfg.generation.batch_size,
         "total_seconds": round(elapsed, 2),
         "seconds_per_item": round(elapsed / max(1, len(rows)), 3),
-        "mean_prompt_tokens": round(sum(valid_tokens) / max(1, len(valid_tokens)), 1),
+        "mean_prompt_tokens": round(sum(token_counts) / max(1, len(token_counts)), 1),
         "host": platform.node(),
         "platform": platform.platform(),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),

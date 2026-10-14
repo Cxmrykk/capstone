@@ -204,6 +204,30 @@ def _summarise_targets(targets) -> Any:
     return {"n_modules": len(targets), "leaf_names": leaves}
 
 
+def _adapted_module_summary(model, requested) -> Dict[str, Any]:
+    """Describes the modules that actually received LoRA layers.
+
+    Unsloth takes leaf names (e.g. 12) and expands them over every layer, so
+    reporting the requested list understated the adapted set (history/030.md).
+    """
+    paths: List[str] = []
+    for name, module in model.named_modules():
+        lora_a = getattr(module, "lora_A", None)
+        if lora_a is None or not hasattr(module, "lora_B"):
+            continue
+        try:
+            if len(lora_a) == 0:
+                continue
+        except TypeError:
+            pass
+        paths.append(name)
+    return {
+        "n_modules": len(paths),
+        "leaf_names": sorted({p.split(".")[-1] for p in paths}),
+        "requested": _summarise_targets(requested),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Verified Adapter Loading
 # --------------------------------------------------------------------------- #
@@ -517,7 +541,7 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
             use_gradient_checkpointing="unsloth" if cfg.train.gradient_checkpointing else False,
             random_state=cfg.train.seed,
         )
-        meta["target_modules"] = _summarise_targets(targets)
+        meta["target_modules"] = _adapted_module_summary(model, targets)
         _finalise(model, tokenizer, cfg, for_training)
         return model, tokenizer, meta
 
@@ -563,7 +587,7 @@ def load_model_and_tokenizer(cfg: RunConfig, for_training: bool = True,
         )
         model = get_peft_model(model, peft_cfg)
         _upcast_trainable_to_fp32(model)
-        meta["target_modules"] = _summarise_targets(targets)
+        meta["target_modules"] = _adapted_module_summary(model, targets)
         try:
             model.print_trainable_parameters()
         except Exception:

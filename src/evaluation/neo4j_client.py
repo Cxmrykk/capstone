@@ -4,6 +4,10 @@ Supported connection providers:
   * "demo"  -- Neo4j Labs public demo server. Resolves database aliases
                (e.g., neo4jlabs_demo_db_fincen) using demo endpoint conventions.
   * "local" -- Local Neo4j instance for offline development and testing.
+
+Connectivity failures (outages, timeouts) are never cached and never counted as
+model errors: rows hit by one get execution_status "connection_failed"
+(history/030.md).
 """
 from __future__ import annotations
 
@@ -25,6 +29,21 @@ log = get_logger(__name__)
 
 _ALIAS_PREFIXES = ("neo4jlabs_demo_db_", "neo4jlabs_demo_", "neo4j_demo_", "demo_db_")
 _ORDER_BY_RE = re.compile(r"\border\s+by\b", re.IGNORECASE)
+
+# Matched against lower-cased "<ExceptionType>: <message>". The previous list had
+# "servicunavailable", which never matched neo4j.exceptions.ServiceUnavailable,
+# so outages were retried briefly and then CACHED as query failures (history/030.md).
+_FATAL_CONNECT_TOKENS = ("authentication", "unauthorized", "cannot resolve",
+                         "unable to retrieve routing")
+_TRANSIENT_CONNECT_TOKENS = ("serviceunavailable", "sessionexpired", "connection refused",
+                             "connection reset", "failed to establish connection")
+# Consecutive queries with connectivity errors before a target is marked unreachable.
+_UNREACHABLE_AFTER = 3
+
+
+def _is_connectivity_error(text: Optional[str]) -> bool:
+    lowered = (text or "").lower()
+    return any(tok in lowered for tok in _FATAL_CONNECT_TOKENS + _TRANSIENT_CONNECT_TOKENS)
 
 
 @dataclass(frozen=True)
@@ -162,6 +181,7 @@ class ExecutionResult:
     error: Optional[str] = None
     elapsed_s: float = 0.0
     from_cache: bool = False
+    connectivity_error: bool = False
 
     def signature(self, order_sensitive: bool, compare_keys: bool) -> Optional[str]:
         if not self.ok:
@@ -182,6 +202,7 @@ class Neo4jExecutor:
         if use_cache:
             self._cache_root.mkdir(parents=True, exist_ok=True)
         self._unreachable: Dict[str, str] = {}
+        self._conn_failures: Dict[str, int] = {}
 
     def _driver(self, target: Neo4jTarget):
         with self._lock:
@@ -254,15 +275,18 @@ class Neo4jExecutor:
             time.sleep(self.cfg.min_interval_s - delta)
         self._last_call = time.time()
 
-    def validate_syntax(self, target: Neo4jTarget, query: str) -> Tuple[bool, Optional[str]]:
-        """Validates query syntax and schema alignment using EXPLAIN without full execution."""
+    def validate_syntax(self, target: Neo4jTarget, query: str) -> Tuple[Optional[bool], Optional[str]]:
+        """EXPLAIN-based validation. Returns (None, error) for connectivity failures,
+        which say nothing about the query and are never cached."""
         if not (query or "").strip():
             return False, "empty query"
 
         cache_file = self._cache_path(target, query, "explain")
         cached = self._read_cache(cache_file)
-        if cached is not None:
+        if cached is not None and (cached["ok"] or not _is_connectivity_error(cached.get("error"))):
             return cached["ok"], cached.get("error")
+        if target.key() in self._unreachable:
+            return None, f"unreachable: {self._unreachable[target.key()]}"
 
         try:
             self._throttle()
@@ -273,6 +297,8 @@ class Neo4jExecutor:
             return True, None
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
+            if _is_connectivity_error(msg):
+                return None, msg
             self._write_cache(cache_file, {"ok": False, "error": msg})
             return False, msg
 
@@ -281,13 +307,16 @@ class Neo4jExecutor:
         if not (query or "").strip():
             return ExecutionResult(ok=False, keys=[], rows=[], error="empty query")
 
-        if target.key() in self._unreachable:
+        key = target.key()
+        if key in self._unreachable:
             return ExecutionResult(ok=False, keys=[], rows=[],
-                                   error=f"unreachable: {self._unreachable[target.key()]}")
+                                   error=f"unreachable: {self._unreachable[key]}",
+                                   connectivity_error=True)
 
         cache_file = self._cache_path(target, query, "run")
         cached = self._read_cache(cache_file)
-        if cached is not None:
+        # Ignore legacy cache entries that recorded an outage as a query failure.
+        if cached is not None and (cached["ok"] or not _is_connectivity_error(cached.get("error"))):
             return ExecutionResult(
                 ok=cached["ok"],
                 keys=cached.get("keys", []),
@@ -298,6 +327,7 @@ class Neo4jExecutor:
             )
 
         last_error = "unknown"
+        connectivity = False
         for attempt in range(self.cfg.max_retries + 1):
             try:
                 self._throttle()
@@ -312,25 +342,34 @@ class Neo4jExecutor:
                     "error": None, "elapsed_s": round(time.time() - t0, 3),
                 }
                 self._write_cache(cache_file, payload)
+                self._conn_failures.pop(key, None)
                 return ExecutionResult(True, keys, rows, None, payload["elapsed_s"])
 
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 lowered = last_error.lower()
-                if any(tok in lowered for tok in
-                       ("authentication", "unauthorized", "servicunavailable",
-                        "cannot resolve", "unable to retrieve routing")):
-                    if attempt == 0:
-                        log.error("Unable to connect to %s (%s): %s",
-                                  target.database, target.uri, last_error)
-                    self._unreachable[target.key()] = last_error
+                if any(tok in lowered for tok in _FATAL_CONNECT_TOKENS):
+                    log.error("Unable to connect to %s (%s): %s",
+                              target.database, target.uri, last_error)
+                    self._unreachable[key] = last_error
+                    connectivity = True
                     break
+                connectivity = any(tok in lowered for tok in _TRANSIENT_CONNECT_TOKENS)
                 if attempt < self.cfg.max_retries:
-                    time.sleep(1.0 + attempt)
+                    time.sleep(5.0 * (attempt + 1) if connectivity else 1.0 + attempt)
 
+        if connectivity:
+            n = self._conn_failures.get(key, 0) + 1
+            self._conn_failures[key] = n
+            if n >= _UNREACHABLE_AFTER and key not in self._unreachable:
+                log.error("%s unreachable after %d consecutive queries: %s",
+                          target.database, n, last_error)
+                self._unreachable[key] = last_error
+            return ExecutionResult(False, [], [], last_error, connectivity_error=True)
+
+        self._conn_failures.pop(key, None)
         payload = {"ok": False, "keys": [], "rows": [], "error": last_error, "elapsed_s": 0.0}
-        if "unreachable" not in last_error.lower():
-            self._write_cache(cache_file, payload)
+        self._write_cache(cache_file, payload)
         return ExecutionResult(False, [], [], last_error)
 
     def compare(self, target: Neo4jTarget, gold_cypher: str,
@@ -344,15 +383,15 @@ class Neo4jExecutor:
         gold_sig = gold.signature(order_sensitive, self.cfg.compare_keys)
         pred_sig = pred.signature(order_sensitive, self.cfg.compare_keys)
 
-        if not gold.ok:
-            status = "gold_failed"
-            match = None
+        if gold.connectivity_error or pred.connectivity_error:
+            # Neither query was judged; never count this row as a model error.
+            status, match = "connection_failed", None
+        elif not gold.ok:
+            status, match = "gold_failed", None
         elif not pred.ok:
-            status = "pred_failed"
-            match = False
+            status, match = "pred_failed", False
         else:
-            status = "compared"
-            match = gold_sig == pred_sig
+            status, match = "compared", gold_sig == pred_sig
 
         return {
             "execution_status": status,

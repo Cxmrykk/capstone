@@ -162,6 +162,9 @@ def classify_complexity(cypher: str) -> Complexity:
 
 COMPLEXITY_ORDER = ["easy", "medium", "hard", "extra_hard"]
 
+# Execution statuses that carry no evidence about the prediction.
+NOT_SCORED_STATUSES = frozenset({"connection_failed", "excluded_dead_db"})
+
 
 # --------------------------------------------------------------------------- #
 # Summarization & Aggregation
@@ -187,13 +190,33 @@ def summarise(rows: List[Dict], key_prefix: str = "") -> Dict[str, float]:
             sum(1 for r in rows if not r["predicted_cypher"].strip()) / len(rows), 4),
     }
 
-    executed = [r for r in rows if r.get("execution_status") is not None]
+    attempted = [r for r in rows if r.get("execution_status") is not None]
+    executed = [r for r in attempted if r.get("execution_status") not in NOT_SCORED_STATUSES]
+    if attempted:
+        out[f"{key_prefix}n_connection_failed"] = sum(
+            1 for r in attempted if r.get("execution_status") == "connection_failed")
+        out[f"{key_prefix}n_excluded_dead_db"] = sum(
+            1 for r in attempted if r.get("execution_status") == "excluded_dead_db")
     if executed:
         out[f"{key_prefix}n_executed"] = len(executed)
         out[f"{key_prefix}executable_rate"] = round(
             sum(1 for r in executed if r.get("pred_executed_ok")) / len(executed), 4)
         out[f"{key_prefix}execution_accuracy"] = round(
             sum(1 for r in executed if r.get("execution_match")) / len(executed), 4)
+        gold_ok = [r for r in executed if r.get("gold_executed_ok")]
+        out[f"{key_prefix}n_gold_failed"] = len(executed) - len(gold_ok)
+        if gold_ok:
+            out[f"{key_prefix}execution_accuracy_gold_ok"] = round(
+                sum(1 for r in gold_ok if r.get("execution_match")) / len(gold_ok), 4)
+            out[f"{key_prefix}executable_rate_gold_ok"] = round(
+                sum(1 for r in gold_ok if r.get("pred_executed_ok")) / len(gold_ok), 4)
+
+    fitted = [r for r in rows if r.get("schema_trimmed") is not None]
+    if fitted:
+        n_trim = sum(1 for r in fitted if r.get("schema_trimmed"))
+        out[f"{key_prefix}n_schema_trimmed"] = n_trim
+        out[f"{key_prefix}schema_trimmed_rate"] = round(n_trim / len(fitted), 4)
+        out[f"{key_prefix}n_prompt_over_budget"] = sum(1 for r in fitted if r.get("prompt_over_budget"))
 
     validated = [r for r in rows if r.get("syntax_valid") is not None]
     if validated:
