@@ -2,6 +2,13 @@
 # Unsloth is not needed: merging loads adapters through Transformers + PEFT.
 run_step('bootstrap', 'bash scripts/colab_bootstrap.sh', env={'INSTALL_UNSLOTH': '0'})
 
+# PEFT must be able to inject LoRA layers on this image (history/033.md). An old
+# preinstalled torchao makes PEFT raise ImportError during adapter loading. The
+# bootstrap removes it; this check fails in seconds instead of after loading
+# every base model in the export cell.
+run_step('peft-check', 'python -c "from peft.import_utils import is_torchao_available; '
+                       'print(\'torchao usable by PEFT:\', is_torchao_available())"')
+
 DOWNLOAD_TARGETS = {'gemma-4-e2b': 'gemma', 'qwen3.5-2b': 'qwen', 'granite-4.2-3b': 'granite'}
 for target in dict.fromkeys(DOWNLOAD_TARGETS[m] for m, _v, _c in EXPERIMENTS):
     run_step('download-' + target, 'bash download_data.sh ' + target)
