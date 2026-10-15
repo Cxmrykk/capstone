@@ -1,4 +1,35 @@
 # 4. Dependencies, dataset and base models, and a CPU build of llama.cpp
+from importlib import metadata as _metadata
+
+# --------------------------------------------------------------------------- #
+# Freeze packages the kernel may already have imported (history/034.md).
+# Kaggle's kernel imports numpy at startup (matplotlib inline backend). If pip
+# replaces numpy on disk afterwards, lazily loaded numpy submodules come from the
+# new files and fail against the old ones in memory (ImportError: _slice).
+# PIP_CONSTRAINT applies to every pip call in this session, including the ones
+# inside scripts/colab_bootstrap.sh. An unsatisfiable requirement now fails
+# loudly at install time instead of breaking the kernel later.
+# --------------------------------------------------------------------------- #
+FROZEN_DISTS = {'numpy': 'numpy', 'scipy': 'scipy', 'pandas': 'pandas', 'scikit-learn': 'sklearn',
+                'pyarrow': 'pyarrow'}
+
+
+def _dist_version(dist):
+    try:
+        return _metadata.version(dist)
+    except _metadata.PackageNotFoundError:
+        return None
+
+
+FROZEN_BEFORE = {d: _dist_version(d) for d in FROZEN_DISTS}
+IMPORTED_AT_START = sorted(mod for mod in FROZEN_DISTS.values() if mod in sys.modules)
+CONSTRAINTS_FILE = LOG_DIR / 'pip-constraints.txt'
+CONSTRAINTS_FILE.write_text(''.join(d + '==' + v + LF for d, v in FROZEN_BEFORE.items() if v), encoding='utf-8')
+os.environ['PIP_CONSTRAINT'] = str(CONSTRAINTS_FILE)
+print('Already imported by the kernel: ' + (', '.join(IMPORTED_AT_START) or 'none'))
+print('pip constraints (' + str(CONSTRAINTS_FILE) + '): '
+      + ', '.join(d + '==' + v for d, v in FROZEN_BEFORE.items() if v))
+
 # Unsloth is not needed: merging loads adapters through Transformers + PEFT.
 run_step('bootstrap', 'bash scripts/colab_bootstrap.sh', env={'INSTALL_UNSLOTH': '0'})
 
@@ -52,9 +83,32 @@ for binary in ('llama-server', 'llama-quantize', 'llama-bench'):
 
 # The converter uses the checkout's own gguf-py. Its full requirements file pins older
 # transformers releases, so only the light dependencies are installed and the floor re-asserted.
+# PIP_CONSTRAINT (above) keeps numpy and friends at the versions the kernel has loaded.
 run_step('llama-convert-deps', 'python -m pip install --quiet ' + str(LLAMA_DIR / 'gguf-py')
          + ' sentencepiece protobuf && python -m pip install --quiet "transformers>=5.5.0"')
 os.environ['LLAMA_CPP_DIR'] = str(LLAMA_DIR)
+
+# --------------------------------------------------------------------------- #
+# Guard: nothing the kernel depends on may have changed on disk
+# --------------------------------------------------------------------------- #
+FROZEN_AFTER = {d: _dist_version(d) for d in FROZEN_DISTS}
+changed = {d: (FROZEN_BEFORE[d], FROZEN_AFTER[d]) for d in FROZEN_DISTS if FROZEN_BEFORE[d] != FROZEN_AFTER[d]}
+loaded_mismatch = []
+for dist, mod in FROZEN_DISTS.items():
+    loaded = sys.modules.get(mod)
+    loaded_version = getattr(loaded, '__version__', None) if loaded is not None else None
+    if loaded_version and FROZEN_AFTER[dist] and loaded_version != FROZEN_AFTER[dist]:
+        loaded_mismatch.append(mod + ' ' + loaded_version + ' in memory vs ' + FROZEN_AFTER[dist] + ' on disk')
+if changed or loaded_mismatch:
+    raise RuntimeError('Installs changed packages the kernel depends on: '
+                       + '; '.join(d + ' ' + str(a) + ' -> ' + str(b) for d, (a, b) in changed.items())
+                       + ('; ' if changed and loaded_mismatch else '') + '; '.join(loaded_mismatch)
+                       + '. Later in-kernel imports would fail (history/034.md). Check which install ignored '
+                         'PIP_CONSTRAINT in the logs above.')
+run_step('import-check', 'python -c "import numpy, numpy.char, scipy.sparse, sklearn, pandas, transformers; '
+                         'from transformers import AutoTokenizer; print(\'numpy\', numpy.__version__, '
+                         '\'transformers\', transformers.__version__)"')
+print('Frozen packages unchanged: ' + ', '.join(d + ' ' + str(v) for d, v in FROZEN_AFTER.items() if v))
 
 LLAMA_COMMIT = subprocess.run(['git', '-C', str(LLAMA_DIR), 'rev-parse', 'HEAD'],
                               capture_output=True, text=True).stdout.strip()
