@@ -81,12 +81,29 @@ for binary in ('llama-server', 'llama-quantize', 'llama-bench'):
     if not (LLAMA_BIN / binary).exists():
         raise RuntimeError(binary + ' was not built; see the llama-build log.')
 
-# The converter uses the checkout's own gguf-py. Its full requirements file pins older
-# transformers releases, so only the light dependencies are installed and the floor re-asserted.
-# PIP_CONSTRAINT (above) keeps numpy and friends at the versions the kernel has loaded.
-run_step('llama-convert-deps', 'python -m pip install --quiet ' + str(LLAMA_DIR / 'gguf-py')
-         + ' sentencepiece protobuf && python -m pip install --quiet "transformers>=5.5.0"')
+# --------------------------------------------------------------------------- #
+# GGUF converter dependencies (history/035.md)
+# convert_hf_to_gguf.py inserts the checkout's own gguf-py at the front of sys.path
+# unless NO_LOCAL_GGUF is set, so gguf-py is deliberately NOT pip-installed: building
+# it from source needs an isolated poetry-core build environment, which failed under
+# PIP_CONSTRAINT. Only gguf-py's runtime dependencies and the converter's own imports
+# are installed (all prebuilt wheels). The llama.cpp requirements file is avoided
+# because it pins transformers < 5. PIP_CONSTRAINT still keeps numpy and friends at
+# the versions the kernel has loaded.
+# --------------------------------------------------------------------------- #
+os.environ.pop('NO_LOCAL_GGUF', None)
+CONVERT_DEPS = ['sentencepiece', 'protobuf', 'pyyaml', 'tqdm', 'requests', 'safetensors', 'transformers>=5.5.0']
+run_step('llama-convert-deps', 'python -m pip install --disable-pip-version-check '
+         + ' '.join('"' + d + '"' for d in CONVERT_DEPS))
 os.environ['LLAMA_CPP_DIR'] = str(LLAMA_DIR)
+
+# Fails in seconds if the converter cannot import (missing dependency, gguf-py/transformers
+# mismatch) instead of after a 10-30 min merge in the export cell.
+run_step('llama-convert-check',
+         'python -c "import sys; sys.path.insert(1, \'gguf-py\'); import gguf, yaml, sentencepiece, '
+         'google.protobuf, torch, transformers, safetensors; print(\'gguf-py from\', gguf.__file__)" '
+         '&& python convert_hf_to_gguf.py --help > /dev/null && echo "convert_hf_to_gguf.py imports OK"',
+         cwd=str(LLAMA_DIR))
 
 # --------------------------------------------------------------------------- #
 # Guard: nothing the kernel depends on may have changed on disk

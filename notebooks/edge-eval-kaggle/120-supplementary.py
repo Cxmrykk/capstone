@@ -250,13 +250,14 @@ if RUN_SUPPLEMENTARY:
     SUBSET_METRICS = pd.DataFrame(rows)
 
     # (b) Exact-match filter coverage: are the elements the gold query needs still in the pruned schema?
+    edge_id_set = set(EDGE_IDS)
     cov = []
     for iid, rec in REF_BY_ID.items():
         full = FULL_EL.get(iid)
         gl, gr, gp = cypher_elements(rec.get('cypher') or '')
         row = {'instance_id': iid, 'data_source': rec.get('data_source'),
                'has_database': bool(rec.get('database_reference')), 'schema_parsed': full is not None,
-               'in_edge_subset': iid in set(EDGE_IDS)}
+               'in_edge_subset': iid in edge_id_set}
         if full is not None:
             pl, pr, pp = prompt_elements(iid, FILTER_MODE)
             fl, fr, fp = full
@@ -283,17 +284,19 @@ if RUN_SUPPLEMENTARY:
         if not len(sub):
             continue
         cov_rows.append({'group': group, 'n_parsed': len(sub),
-                         'share_fully_covered': float(sub['fully_covered'].mean()),
+                         'share_fully_covered': float(sub['fully_covered'].astype(bool).mean()),
                          'share_missing_label': float(sub['missing_labels'].ne('').mean()),
                          'share_missing_rel_type': float(sub['missing_rel_types'].ne('').mean()),
                          'share_missing_property': float(sub['missing_properties'].ne('').mean()),
                          'share_gold_uses_unknown_element': float((sub['gold_unknown_labels'].ne('')
                                                                    | sub['gold_unknown_rel_types'].ne('')
                                                                    | sub['gold_unknown_properties'].ne('')).mean()),
-                         'share_filter_fell_back': float(sub['filter_fell_back'].mean()),
+                         'share_filter_fell_back': float(sub['filter_fell_back'].astype(bool).mean()),
                          'median_pruned_chars_ratio': float(sub['chars_ratio'].median())})
     COVERAGE = pd.DataFrame(cov_rows)
-    covered = parsed.set_index('instance_id')['fully_covered']
+    # Plain Python bools: with a bool dtype column, Series.get returns numpy.bool_, and
+    # `numpy.bool_(True) is True` is False, which emptied every group below (history/035.md).
+    covered = {str(i): bool(v) for i, v in zip(parsed['instance_id'], parsed['fully_covered'])}
 
     # Coverage vs execution accuracy (GPU references): does the exact-match loss sit where elements were dropped?
     ea_rows = []
@@ -313,7 +316,7 @@ if RUN_SUPPLEMENTARY:
             judged_ids = set(f.index[f['judged']])
             common = judged_ids if common is None else common & judged_ids
         for flag in (True, False):
-            group_ids = sorted(i for i in common if covered.get(i) is flag)
+            group_ids = sorted(i for i in common if i in covered and covered[i] == flag)
             row = {'model': m, 'fully_covered': flag, 'n_judged_all': len(group_ids)}
             for k, f in frames.items():
                 row['ea_' + k] = float(f.loc[group_ids, 'correct'].mean()) if group_ids else NAN
@@ -398,7 +401,7 @@ if RUN_SUPPLEMENTARY:
     base_id = next((j for j in ALL_JOBS if ALL_JOBS[j]['source'] == 'gpu_reference'), None)
     if base_id:
         base = ALL_JOBS[base_id]['rows'].copy()
-        base['in_edge_subset'] = base['instance_id'].isin(set(EDGE_IDS))
+        base['in_edge_subset'] = base['instance_id'].isin(edge_id_set)
         COMPOSITION = (base.groupby(['data_source', 'has_database', 'complexity'], dropna=False)
                        .agg(n_reference=('instance_id', 'size'), n_edge=('in_edge_subset', 'sum'))
                        .reset_index().sort_values('n_reference', ascending=False))

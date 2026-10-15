@@ -17,8 +17,12 @@ def _short(jid):
     return jid.replace('__fine_tuned', '').replace('__gguf_', LF).replace('_cpu', '').replace('_prompts', ' prompts')
 
 
+# Benchmark rows that succeeded (failed quants carry an 'error' and no 'test').
+BENCH_OK = (BENCH[BENCH['tokens_per_s'].notna() & BENCH['test'].notna()]
+            if not BENCH.empty and {'tokens_per_s', 'test'} <= set(BENCH.columns) else pd.DataFrame())
+
 # Figure 1: execution accuracy, GPU 4-bit vs CPU GGUF on identical rows (Wilson CIs).
-if not OVERALL.empty and OVERALL['execution_accuracy'].notna().any():
+if not OVERALL.empty and 'execution_accuracy' in OVERALL.columns and OVERALL['execution_accuracy'].notna().any():
     sub = OVERALL.dropna(subset=['execution_accuracy'])
     x = np.arange(len(sub))
     fig, ax = plt.subplots(figsize=(max(6, 1.3 * len(sub)), 4))
@@ -41,30 +45,31 @@ if not OVERALL.empty and OVERALL['execution_accuracy'].notna().any():
     save_fig(fig, 'fig1_edge_vs_gpu_execution_accuracy')
 
 # Figure 2: per-query latency, median prefill + decode, with p95 marker.
-if not OVERALL.empty and 'prefill_ms_p50' in OVERALL.columns:
+if not OVERALL.empty and {'prefill_ms_p50', 'decode_ms_p50', 'wall_ms_p50', 'wall_ms_p95'} <= set(OVERALL.columns):
     sub = OVERALL.dropna(subset=['wall_ms_p50'])
-    y = np.arange(len(sub))
-    fig, ax = plt.subplots(figsize=(8, 0.45 * len(sub) + 1.5))
-    pre = sub['prefill_ms_p50'].to_numpy(float) / 1000
-    dec = sub['decode_ms_p50'].to_numpy(float) / 1000
-    ax.barh(y, pre, label='prefill (median)')
-    ax.barh(y, dec, left=pre, label='decode (median)')
-    ax.scatter(sub['wall_ms_p95'].to_numpy(float) / 1000, y, marker='|', s=200, color='black', label='p95 total')
-    ax.set_yticks(y)
-    ax.set_yticklabels([_short(j).replace(LF, ' ') for j in sub['job_id']], fontsize=7)
-    ax.set_xlabel('Seconds per query (' + CPU_MODEL[:40] + ')')
-    ax.set_title('Per-query latency on the CPU')
-    ax.grid(axis='x', alpha=0.3)
-    ax.legend(fontsize=7)
-    save_fig(fig, 'fig2_latency_breakdown')
+    if not sub.empty:
+        y = np.arange(len(sub))
+        fig, ax = plt.subplots(figsize=(8, 0.45 * len(sub) + 1.5))
+        pre = np.nan_to_num(sub['prefill_ms_p50'].to_numpy(float) / 1000)
+        dec = np.nan_to_num(sub['decode_ms_p50'].to_numpy(float) / 1000)
+        ax.barh(y, pre, label='prefill (median)')
+        ax.barh(y, dec, left=pre, label='decode (median)')
+        ax.scatter(sub['wall_ms_p95'].to_numpy(float) / 1000, y, marker='|', s=200, color='black', label='p95 total')
+        ax.set_yticks(y)
+        ax.set_yticklabels([_short(j).replace(LF, ' ') for j in sub['job_id']], fontsize=7)
+        ax.set_xlabel('Seconds per query (' + CPU_MODEL[:40] + ')')
+        ax.set_title('Per-query latency on the CPU')
+        ax.grid(axis='x', alpha=0.3)
+        ax.legend(fontsize=7)
+        save_fig(fig, 'fig2_latency_breakdown')
 
 # Figure 3: llama-bench throughput vs threads.
-if not BENCH.empty and 'tokens_per_s' in BENCH.columns:
-    sweep = BENCH[BENCH['quant'].isin(THREAD_SWEEP_QUANTS) & BENCH['tokens_per_s'].notna()]
+if not BENCH_OK.empty:
+    sweep = BENCH_OK[BENCH_OK['quant'].isin(THREAD_SWEEP_QUANTS)]
     if not sweep.empty:
         fig, axes = plt.subplots(1, 2, figsize=(11, 4))
         for ax, kind in zip(axes, ('pp', 'tg')):
-            for (model, quant), g in sweep[sweep['test'].str.startswith(kind)].groupby(['model', 'quant']):
+            for (model, quant), g in sweep[sweep['test'].str.startswith(kind, na=False)].groupby(['model', 'quant']):
                 g = g.sort_values('threads')
                 ax.errorbar(g['threads'], g['tokens_per_s'], yerr=g['tokens_per_s_sd'], marker='o', capsize=3,
                             label=model + ' ' + quant)
@@ -77,8 +82,8 @@ if not BENCH.empty and 'tokens_per_s' in BENCH.columns:
         save_fig(fig, 'fig3_throughput_vs_threads')
 
 # Figure 4: quantisation trade-off: file size vs generation speed (full thread count).
-if not BENCH.empty and 'tokens_per_s' in BENCH.columns:
-    tg = BENCH[BENCH['test'].str.startswith('tg') & BENCH['threads'].eq(LOGICAL_CPUS)].dropna(subset=['tokens_per_s'])
+if not BENCH_OK.empty:
+    tg = BENCH_OK[BENCH_OK['test'].str.startswith('tg', na=False) & BENCH_OK['threads'].eq(LOGICAL_CPUS)]
     if not tg.empty:
         fig, ax = plt.subplots(figsize=(7, 4))
         for model, g in tg.groupby('model'):
@@ -94,7 +99,7 @@ if not BENCH.empty and 'tokens_per_s' in BENCH.columns:
         save_fig(fig, 'fig4_quant_size_vs_speed')
 
 # Figure 5: prefill time vs prompt tokens (why schema filtering matters on the CPU).
-if not EDGE_LONG.empty and 'edge_prompt_ms' in EDGE_LONG.columns:
+if not EDGE_LONG.empty and {'edge_prompt_ms', 'edge_tokens_evaluated'} <= set(EDGE_LONG.columns):
     pts = EDGE_LONG[EDGE_LONG['quant'] == ACCURACY_QUANT]
     if not pts.empty:
         fig, ax = plt.subplots(figsize=(7, 4))
@@ -135,7 +140,8 @@ if not HALLUCINATION.empty:
     save_fig(fig, 'fig7_schema_hallucination')
 
 # Figure 8: accuracy vs memory footprint on the CPU.
-if not OVERALL.empty and OVERALL['peak_rss_mb'].notna().any() and OVERALL['execution_accuracy'].notna().any():
+if (not OVERALL.empty and {'peak_rss_mb', 'execution_accuracy'} <= set(OVERALL.columns)
+        and OVERALL['peak_rss_mb'].notna().any() and OVERALL['execution_accuracy'].notna().any()):
     fig, ax = plt.subplots(figsize=(7, 4))
     for _, r in OVERALL.dropna(subset=['peak_rss_mb', 'execution_accuracy']).iterrows():
         ax.scatter(r['peak_rss_mb'], r['execution_accuracy'])

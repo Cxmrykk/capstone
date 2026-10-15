@@ -177,6 +177,18 @@ def _clean_lines(buf, text):
     return [p.split(CR)[-1] for p in parts[:-1]], parts[-1].split(CR)[-1]
 
 
+def _log_tail(path, n=25):
+    """Last n lines of a step log, without the runner's own trailer lines."""
+    try:
+        lines = Path(path).read_text(encoding='utf-8', errors='replace').splitlines()
+    except Exception:
+        return ''
+    lines = [ln for ln in lines if not ln.startswith(('# exit code:', '# elapsed:'))]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return LF.join(lines[-n:])
+
+
 def run_step(name, cmd, log_path=None, allow_fail=False, env=None, cwd=None, echo=True):
     log_path = Path(log_path) if log_path else LOG_DIR / (name + '.log')
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,7 +234,11 @@ def run_step(name, cmd, log_path=None, allow_fail=False, env=None, cwd=None, ech
     STATUS['current_step'] = None
     print('[' + name + '] exit ' + str(rc) + ' after ' + format(elapsed / 60, '.1f') + ' min', flush=True)
     if rc != 0 and not allow_fail:
-        raise RuntimeError('Step ' + name + ' failed with exit code ' + str(rc) + '. See ' + str(log_path))
+        # Include the tail so the cause is visible in the traceback and the ntfy alert,
+        # not only in the log file (history/035.md).
+        tail = _log_tail(log_path)
+        raise RuntimeError('Step ' + name + ' failed with exit code ' + str(rc) + '. See ' + str(log_path)
+                           + ((LF + 'Last output:' + LF + tail) if tail else ''))
     return rc
 
 
