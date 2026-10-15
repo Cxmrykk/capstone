@@ -1,0 +1,33 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "gpuType": "T4"
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    },
+    "accelerator": "GPU"
+  },
+  "cell_metadata": {
+    "10-intro.md": {"id": "intro-md"},
+    "20-config.py": {"id": "config-code"},
+    "30-helpers.py": {"id": "helpers-code"},
+    "40-clone-pin.py": {"id": "clone-code"},
+    "50-install-download.py": {"id": "install-code"},
+    "60-neo4j-check.py": {"id": "neo4j-code"},
+    "70-adapters.py": {"id": "resolve-code"},
+    "80-jobs.py": {"id": "jobs-code"},
+    "90-gguf-bench.py": {"id": "gguf-code"},
+    "100-telemetry.py": {"id": "training-code"},
+    "110-aggregate.py": {"id": "aggregate-code"},
+    "120-figures.py": {"id": "figures-code"},
+    "130-bundle.py": {"id": "export-code"}
+  }
+}

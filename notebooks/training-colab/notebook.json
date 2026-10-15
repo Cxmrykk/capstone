@@ -1,0 +1,32 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "gpuType": "T4"
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    },
+    "accelerator": "GPU"
+  },
+  "cell_metadata": {
+    "10-intro.md": {"id": "intro-md"},
+    "20-config.py": {"id": "config-code"},
+    "30-helpers.py": {"id": "helpers-code"},
+    "40-clone.py": {"id": "clone-code"},
+    "50-bootstrap.py": {"id": "bootstrap-code"},
+    "60-download.py": {"id": "download-code"},
+    "70-diagnostics.py": {"id": "diag-code"},
+    "80-train.py": {"id": "train-code"},
+    "90-predict.py": {"id": "predict-code"},
+    "100-evaluate.py": {"id": "eval-code"},
+    "110-export.py": {"id": "export-code"},
+    "120-summary.py": {"id": "summary-code"}
+  }
+}
