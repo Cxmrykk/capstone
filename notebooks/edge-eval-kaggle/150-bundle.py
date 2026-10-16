@@ -38,13 +38,17 @@ MANIFEST = {
                                           'neo4j', 'pandas', 'numpy', 'requests')},
     'export': {'merge_dtype': MERGE_DTYPE, 'intermediate': 'f16 GGUF (convert_hf_to_gguf.py)',
                'quantiser': 'llama-quantize from the same build'},
-    'serving': {'server': 'llama-server', 'flags': '--parallel 1 --no-mmap --no-warmup', 'threads': THREADS_FOR,
-                'server_threads_setting': SERVER_THREADS, 'cache_prompt': CACHE_PROMPT, 'edge_stop_mode': EDGE_STOP_MODE,
+    'serving': {'server': 'llama-server', 'command_template': server_cmd_template(),
+                'mmap': SERVER_MMAP['mode'], 'mmap_env': SERVER_MMAP['env'],
+                'mmap_help_lines': SERVER_MMAP['help_lines'], 'rejected_options': sorted(SERVER_REJECTED),
+                'smoke_test': SERVER_SMOKE, 'help_file': str(LOG_DIR / 'llama-server-help.txt'),
+                'threads': THREADS_FOR, 'server_threads_setting': SERVER_THREADS, 'cache_prompt': CACHE_PROMPT,
+                'edge_stop_mode': EDGE_STOP_MODE,
                 'decoding': 'greedy (temperature 0, top_k 1); max_new_tokens from each config',
                 'warmup': 'one untimed 1-token request after load, excluded from latency statistics'},
     'benchmark': {'tool': 'llama-bench', 'prompt_tokens': BENCH_PROMPT_TOKENS, 'gen_tokens': BENCH_GEN_TOKENS,
                   'reps': BENCH_REPS, 'threads': BENCH_THREADS, 'thread_sweep_quants': THREAD_SWEEP_QUANTS,
-                  'latency_quants': LATENCY_QUANTS},
+                  'latency_quants': LATENCY_QUANTS, 'mmap': 'llama-bench default'},
     'execution_provider': 'Neo4j Labs demo server (neo4j+s://demo.neo4jlabs.com:7687)',
     'dead_db_policy': DEAD_DB_POLICY,
     'statistics': {'ci_level': CI_LEVEL, 'bootstrap_samples': BOOTSTRAP_SAMPLES, 'stats_seed': STATS_SEED,
@@ -115,12 +119,20 @@ for sub_name, src_root, names in (('jobs', EDGE_DIR / 'jobs', ('job.json', 'repo
             shutil.copy2(item, dest / item.name)
 
 cpu_short = CPU_MODEL + ', ' + str(LOGICAL_CPUS) + ' logical CPUs'
+if server_mmap_off():
+    load_desc = ('`load_s` is process start to a healthy /health endpoint with memory mapping off ('
+                 + SERVER_MMAP['mode'] + '; weights are read into memory during load)')
+else:
+    load_desc = ('`load_s` is process start to a healthy /health endpoint with memory mapping ON ('
+                 + SERVER_MMAP['mode'] + '): weights are paged in lazily, so `load_s` understates the cost of '
+                 'reading them; `first_request_ms` and `rss_after_first_request_mb` carry it')
 readme = [
     '# Text2Cypher edge (CPU) evaluation: ' + EDGE_TAG,
     '',
     'Generated ' + created + ' on Kaggle (session ' + SESSION + ', commit ' + GIT_COMMIT[:10] + ', llama.cpp '
     + LLAMA_COMMIT[:10] + ', ' + cpu_short + ').',
     'GPU reference: `final-eval/' + REFERENCE_EVAL_TAG + '` (commits ' + ', '.join(c[:10] for c in REF_COMMITS) + ').',
+    'Server command: `' + server_cmd_template() + '`.',
     '',
     '## Files',
     '- `tables/edge_headline.csv` (+ `.tex`): one row per CPU job: accuracy with CIs, GPU accuracy on the same rows, '
@@ -135,7 +147,8 @@ readme = [
     'latency vs execution accuracy).',
     '- `tables/throughput_llama_bench.csv`: llama-bench tokens/s per model, quantisation, test (ppN/tgN) and threads, '
     'with bits per weight.',
-    '- `tables/footprint.csv`: llama-server load time, RSS after load, peak RSS and first-request time per quantisation.',
+    '- `tables/footprint.csv`: llama-server load time, RSS after load and after the first request, peak RSS, '
+    'first-request time and memory-mapping mode per quantisation.',
     '- `tables/serving_threads.csv`: thread count used for serving and the estimates it was chosen from.',
     '- `tables/exports.csv`: merge/convert/quantise timings, sizes, SHA-256, adapter verification and model class.',
     '- `tables/edge_tokenizer_parity.csv`: GGUF prompt tokens minus training-tokenizer tokens per job.',
@@ -156,8 +169,8 @@ readme = [
     '- Latency: `wall_ms` is client-measured time per request (one request at a time, after one untimed warm-up); '
     '`prefill_ms` and `decode_ms` are llama-server timings for prompt processing and generation.',
     '- `prefill_share_of_wall`: summed prefill time over summed wall time. `queries_per_hour`: 3.6e6 / mean wall ms.',
-    '- Footprint: `load_s` is process start to a healthy /health endpoint with `--no-mmap` (weights read into memory); '
-    '`peak_rss_mb` is VmHWM of the server process.',
+    '- Footprint: ' + load_desc + '; `peak_rss_mb` is VmHWM of the server process (includes mapped weight pages '
+    'once touched).',
     '- Throughput: llama-bench `avg_ts` (tokens/s) for ppN (prompt processing) and tgN (generation), ' + str(BENCH_REPS)
     + ' repetitions. `bits_per_weight` = 8 * model_size / model_n_params as reported by llama-bench.',
     '- Tokenizer parity: `tokens_evaluated` reported by llama-server minus `prompt_tokens` from the training tokenizer. '
@@ -191,6 +204,9 @@ readme = [
     '- Stop condition: ' + ('EOS only, matching the GPU jobs' if EDGE_STOP_MODE == 'hf'
                             else 'EOS plus generation.stop_strings (differs from the GPU jobs)') + '.',
     '- Prompt caching was ' + ('on' if CACHE_PROMPT else 'off') + ': each query pays the full prefill.',
+    '- llama-server memory mapping: ' + SERVER_MMAP['mode'] + '. Options probed from the build\'s --help'
+    + ((' (rejected at start-up and dropped: ' + ', '.join(sorted(SERVER_REJECTED)) + ')') if SERVER_REJECTED else '')
+    + '; llama-bench used its own defaults.',
     '- Load times may benefit from the OS page cache because GGUFs were written shortly before loading.',
     '- Element extraction for coverage and hallucination is regex-based and approximate.',
 ]

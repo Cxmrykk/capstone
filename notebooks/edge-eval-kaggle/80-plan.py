@@ -37,12 +37,14 @@ for e in sorted(EXP, key=lambda x: (not x['adapter_ok'], x['variant'] != 'enhanc
 
 
 def _provenance():
+    # SERVER_MMAP is defined in cell 9; records written before it exist carry None (history/036.md).
     return {'edge_tag': EDGE_TAG, 'edge_ids_sha': EDGE_IDS_SHA, 'n_planned': len(EDGE_IDS),
             'reference_eval_tag': REFERENCE_EVAL_TAG, 'git_ref': GIT_REF, 'git_commit': GIT_COMMIT,
             'git_dirty': GIT_DIRTY, 'llama_cpp_commit': LLAMA_COMMIT, 'llama_cpp_version': LLAMA_VERSION,
             'cpu_model': CPU_MODEL, 'logical_cpus': LOGICAL_CPUS, 'physical_cores': PHYSICAL_CORES,
             'simd_flags': SIMD_FLAGS, 'cgroup_cpu_limit': CGROUP_CPU_LIMIT,
-            'ram_total_gb': round(RAM_TOTAL_GB, 1), 'platform': PLATFORM, 'session': SESSION}
+            'ram_total_gb': round(RAM_TOTAL_GB, 1), 'platform': PLATFORM, 'session': SESSION,
+            'server_mmap_mode': (globals().get('SERVER_MMAP') or {}).get('mode')}
 
 
 def _reuse_mismatch(rec):
@@ -53,6 +55,17 @@ def _reuse_mismatch(rec):
         if rec.get(key) != want:
             return key + ' differs (' + str(rec.get(key))[:24] + ' vs ' + str(want)[:24] + ')'
     return None
+
+
+def _bench_rows_complete(rec):
+    rows = rec.get('bench_rows') or []
+    return bool(rows) and not any(r.get('error') for r in rows)
+
+
+def _footprint_missing(rec):
+    """Latency quantisations without a successful llama-server footprint (history/036.md)."""
+    ok = {f.get('quant') for f in rec.get('footprint') or [] if not f.get('error')}
+    return sorted(set(LATENCY_QUANTS) - ok, key=_qkey)
 
 
 def _job_record(job, **extra):
@@ -68,6 +81,7 @@ def _job_record(job, **extra):
 
 JOB_RESULTS = {}
 BENCH_RESULTS = {}
+REUSED_BENCH_ROWS = {}  # model -> Hub bench record whose llama-bench rows are kept; footprint re-measured
 EXPORT_RECORDS = {}
 SKIPPED_FOR_TIME = []
 files = hub_files(refresh=True)
@@ -119,11 +133,21 @@ for model, e in BENCH_PLAN.items():
     if SKIP_COMPLETED_JOBS and path in files:
         rec = json.loads(hub_download_file(path).read_text(encoding='utf-8'))
         why = _reuse_mismatch(rec)
-        if not why:
-            BENCH_RESULTS[model] = rec
-            print('[bench ' + model + '] reusing results from the Hub.')
-            continue
-        print('[bench ' + model + '] Hub results not reused: ' + why + '.')
+        if why:
+            print('[bench ' + model + '] Hub results not reused: ' + why + '.')
+        elif not _bench_rows_complete(rec):
+            print('[bench ' + model + '] Hub results not reused: llama-bench rows missing or failed.')
+        else:
+            missing = _footprint_missing(rec)
+            if not missing:
+                BENCH_RESULTS[model] = rec
+                print('[bench ' + model + '] reusing results from the Hub.')
+                continue
+            # An earlier session measured throughput but its footprint failed (e.g. the
+            # --no-mmap rejection, history/036.md): keep the llama-bench rows, redo the footprint.
+            REUSED_BENCH_ROWS[model] = rec
+            print('[bench ' + model + '] reusing llama-bench rows; footprint incomplete for '
+                  + ', '.join(missing) + ', re-measuring it.')
     PENDING_BENCH.append(model)
 
 NEEDED_QUANTS = {}
@@ -138,6 +162,7 @@ print('Jobs planned : ' + str(len(JOBS)) + ' | reused ' + str(sum(1 for r in JOB
       + ' | pending ' + str(len(PENDING_JOBS)))
 for job in PENDING_JOBS:
     print('  [p' + str(job['priority']) + '] ' + job['job_id'])
-print('Benchmarks pending: ' + (', '.join(PENDING_BENCH) or 'none'))
+print('Benchmarks pending: ' + (', '.join(m + (' (footprint only)' if m in REUSED_BENCH_ROWS else '')
+                                          for m in PENDING_BENCH) or 'none'))
 for rn, qs in NEEDED_QUANTS.items():
     print('  export ' + rn + ': ' + ', '.join(sorted(qs, key=_qkey)))
